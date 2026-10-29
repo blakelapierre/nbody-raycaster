@@ -195,6 +195,27 @@ const intersects = (ray, object) => {
 };
 const REFLECTION_STEPS = 4;
 const REFLECT_BIAS = 0.05;
+const ATLAS = 1024;
+const TEX_TILE = 128;
+const ATLAS_TILES = ATLAS / TEX_TILE;
+const sphereAlbedo = (sphere, point) => {
+    const color = sphere.color;
+    const tex = sphere.texture;
+    if (!tex || !tex.data || !tex.width || !tex.height)
+        return color;
+    const n = vUnit(vDifference(sphere.origin, point));
+    let u = Math.atan2(n[2], n[0]) / (Math.PI * 2) + 0.5;
+    let v = Math.asin(Math.max(-1, Math.min(1, n[1]))) / Math.PI + 0.5;
+    if (u < 0)
+        u = 0;
+    if (u >= 1)
+        u = 0.999999;
+    const x = Math.min(tex.width - 1, (u * tex.width) | 0);
+    const y = Math.min(tex.height - 1, (v * tex.height) | 0);
+    const i = (y * tex.width + x) * 4;
+    const data = tex.data;
+    return [data[i] / 255, data[i + 1] / 255, data[i + 2] / 255, color[3]];
+};
 const traceRay = (dir, origin, scene, base, stepsLeft) => {
     const ray = [dir[0], dir[1], dir[2]];
     ray.origin = origin;
@@ -218,7 +239,7 @@ const traceRay = (dir, origin, scene, base, stepsLeft) => {
     }
     if (!bestSphere)
         return base;
-    const color = bestSphere.color;
+    const color = sphereAlbedo(bestSphere, bestPoint);
     const reflectivity = stepsLeft > 0 ? Math.min(1, Math.max(0, bestSphere.reflectivity || 0)) : 0;
     if (reflectivity <= 0)
         return color;
@@ -402,6 +423,28 @@ let frame;
 const MAX_SPHERES = 64;
 const gpuSphereData = new Float32Array(MAX_SPHERES * 4);
 const gpuColorData = new Float32Array(MAX_SPHERES * 4);
+const gpuTexRectData = new Float32Array(MAX_SPHERES * 4);
+const gpuAtlasData = new Uint8Array(ATLAS * ATLAS * 4);
+const blitTexture = (tile, tex) => {
+    const col = tile % ATLAS_TILES;
+    const row = (tile / ATLAS_TILES) | 0;
+    const x0 = col * TEX_TILE;
+    const y0 = row * TEX_TILE;
+    for (let y = 0; y < TEX_TILE; y++) {
+        const sy = Math.min(tex.height - 1, (y * tex.height / TEX_TILE) | 0);
+        const rowOff = (y0 + y) * ATLAS;
+        const srcRow = sy * tex.width;
+        for (let x = 0; x < TEX_TILE; x++) {
+            const sx = Math.min(tex.width - 1, (x * tex.width / TEX_TILE) | 0);
+            const si = (srcRow + sx) * 4;
+            const di = (rowOff + x0 + x) * 4;
+            gpuAtlasData[di] = tex.data[si];
+            gpuAtlasData[di + 1] = tex.data[si + 1];
+            gpuAtlasData[di + 2] = tex.data[si + 2];
+            gpuAtlasData[di + 3] = tex.data[si + 3];
+        }
+    }
+};
 function createGpuPainter(canvas) {
     const gl = canvas.getContext('webgl2', {
         alpha: false,
@@ -427,6 +470,8 @@ uniform vec2 uRes;
 uniform int uCount;
 uniform sampler2D uSpheres;
 uniform sampler2D uColors;
+uniform sampler2D uTexRects;
+uniform sampler2D uAtlas;
 out vec4 fragColor;
 vec3 rotateByQ(vec3 v, vec4 q) {
     float a = q.x;
@@ -434,6 +479,17 @@ vec3 rotateByQ(vec3 v, vec4 q) {
     return qv * (2.0 * dot(qv, v))
         + v * (a * a - dot(qv, qv))
         + cross(qv, v) * (2.0 * a);
+}
+vec3 albedo(vec3 n, int i) {
+    vec4 col = texelFetch(uColors, ivec2(i, 0), 0);
+    vec4 rect = texelFetch(uTexRects, ivec2(i, 0), 0);
+    if (rect.w < 0.5)
+        return col.rgb;
+    float u = atan(n.z, n.x) * 0.15915494309189535 + 0.5;
+    float v = asin(clamp(n.y, -1.0, 1.0)) * 0.3183098861837907 + 0.5;
+    float pad = 0.5 / ${ATLAS}.0;
+    vec2 uv = rect.xy + vec2(pad) + vec2(u, v) * (rect.z - pad * 2.0);
+    return texture(uAtlas, uv).rgb;
 }
 void main() {
     float uu = gl_FragCoord.x / uRes.x;
@@ -448,8 +504,8 @@ void main() {
         float bestT = 1.0e30;
         vec3 hitP = ro;
         vec3 hitC = ro;
-        vec3 hitRgb = vec3(0.0);
         float hitRef = 0.0;
+        int bestI = 0;
         bool found = false;
         for (int i = 0; i < ${MAX_SPHERES}; i++) {
             if (i >= uCount)
@@ -475,13 +531,14 @@ void main() {
             bestT = dist;
             hitP = at;
             hitC = sphere.xyz;
-            vec4 col = texelFetch(uColors, ivec2(i, 0), 0);
-            hitRgb = col.rgb;
-            hitRef = col.a;
+            hitRef = texelFetch(uColors, ivec2(i, 0), 0).a;
+            bestI = i;
             found = true;
         }
         if (!found)
             break;
+        vec3 nrm = normalize(hitP - hitC);
+        vec3 hitRgb = albedo(nrm, bestI);
         float mirror = bounce == 4 ? 0.0 : clamp(hitRef, 0.0, 1.0);
         accum += thru * hitRgb * (1.0 - mirror);
         thru *= mirror;
@@ -522,6 +579,8 @@ void main() {
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
     const sphereTex = gl.createTexture();
     const colorTex = gl.createTexture();
+    const rectTex = gl.createTexture();
+    const atlasTex = gl.createTexture();
     const alloc = (tex, unit) => {
         gl.activeTexture(gl.TEXTURE0 + unit);
         gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -533,6 +592,14 @@ void main() {
     };
     alloc(sphereTex, 0);
     alloc(colorTex, 1);
+    alloc(rectTex, 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, ATLAS, ATLAS, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     const loc = name => gl.getUniformLocation(program, name);
     const uOrigin = loc('uOrigin');
     const uQ = loc('uQ');
@@ -544,8 +611,13 @@ void main() {
     gl.useProgram(program);
     gl.uniform1i(loc('uSpheres'), 0);
     gl.uniform1i(loc('uColors'), 1);
+    gl.uniform1i(loc('uTexRects'), 2);
+    gl.uniform1i(loc('uAtlas'), 3);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    const boundTex = new Array(MAX_SPHERES);
+    const boundRev = new Array(MAX_SPHERES).fill(0);
+    let atlasDirty = false;
     return {
         gl,
         paint(scene) {
@@ -563,7 +635,24 @@ void main() {
                 gpuColorData[i * 4 + 1] = color[1];
                 gpuColorData[i * 4 + 2] = color[2];
                 gpuColorData[i * 4 + 3] = sphere.reflectivity || 0;
+                const tex = sphere.texture;
+                const col = i % ATLAS_TILES;
+                const row = (i / ATLAS_TILES) | 0;
+                gpuTexRectData[i * 4] = col / ATLAS_TILES;
+                gpuTexRectData[i * 4 + 1] = row / ATLAS_TILES;
+                gpuTexRectData[i * 4 + 2] = 1 / ATLAS_TILES;
+                gpuTexRectData[i * 4 + 3] = tex && tex.data ? 1 : 0;
+                const rev = tex ? tex.revision || 0 : 0;
+                if (boundTex[i] !== tex || boundRev[i] !== rev) {
+                    if (tex && tex.data)
+                        blitTexture(i, tex);
+                    boundTex[i] = tex;
+                    boundRev[i] = rev;
+                    atlasDirty = true;
+                }
             }
+            for (let i = count; i < MAX_SPHERES; i++)
+                gpuTexRectData[i * 4 + 3] = 0;
             const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
             gl.useProgram(program);
             gl.viewport(0, 0, canvas.width, canvas.height);
@@ -573,6 +662,15 @@ void main() {
             gl.activeTexture(gl.TEXTURE1);
             gl.bindTexture(gl.TEXTURE_2D, colorTex);
             gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuColorData);
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, rectTex);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuTexRectData);
+            if (atlasDirty) {
+                gl.activeTexture(gl.TEXTURE3);
+                gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+                gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, ATLAS, ATLAS, gl.RGBA, gl.UNSIGNED_BYTE, gpuAtlasData);
+                atlasDirty = false;
+            }
             gl.uniform3f(uOrigin, scene.camera.origin[0], scene.camera.origin[1], scene.camera.origin[2]);
             gl.uniform4f(uQ, q[0], q[1], q[2], q[3]);
             gl.uniform1f(uFov, scene.camera.fov);
@@ -666,7 +764,8 @@ function syncSceneObjects(scene) {
             radius: mass.size,
             origin: mass.position,
             color: [c[0] / 255, c[1] / 255, c[2] / 255, c[3] > 1 ? c[3] / 255 : c[3]],
-            reflectivity: mass.reflectivity || 0
+            reflectivity: mass.reflectivity || 0,
+            texture: mass.texture || null
         }]);
     }
     scene.objects = objects;
@@ -693,9 +792,75 @@ function syncCameraInputs() {
         });
     }
 }
+const texHash = (x, y) => {
+    const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+    return n - Math.floor(n);
+};
+const texNoise = (x, y) => {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const fx = x - x0;
+    const fy = y - y0;
+    const a = texHash(x0, y0);
+    const b = texHash(x0 + 1, y0);
+    const c = texHash(x0, y0 + 1);
+    const d = texHash(x0 + 1, y0 + 1);
+    const ux = fx * fx * (3 - 2 * fx);
+    const uy = fy * fy * (3 - 2 * fy);
+    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+};
+function makeTexture(width, height, fill) {
+    const data = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const px = fill(x, y, width, height);
+            const i = (y * width + x) * 4;
+            data[i] = px[0];
+            data[i + 1] = px[1];
+            data[i + 2] = px[2];
+            data[i + 3] = px.length > 3 ? px[3] : 255;
+        }
+    }
+    return { width, height, data, revision: 0 };
+}
+function textureFromImage(source) {
+    const width = source.naturalWidth || source.width;
+    const height = source.naturalHeight || source.height;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(source, 0, 0, width, height);
+    const image = ctx.getImageData(0, 0, width, height);
+    return { width, height, data: image.data, revision: 0 };
+}
+function planetTexture(index) {
+    if (index === 0)
+        return makeTexture(128, 128, (x, y, w, h) => {
+            const band = Math.sin((y / h) * Math.PI * 7 + texNoise(x / 18, y / 8) * 2.2);
+            return band > 0 ? [150, 196, 255, 255] : [18, 42, 130, 255];
+        });
+    if (index === 1)
+        return makeTexture(128, 128, (x, y) => {
+            const land = texNoise(x / 18, y / 18) > 0.52;
+            return land ? [92, 28, 18, 255] : [214, 96, 48, 255];
+        });
+    return makeTexture(128, 128, (x, y) => {
+        const n = texNoise(x / 14, y / 14);
+        return Math.abs(n - 0.5) < 0.045 ? [36, 44, 64, 255] : [232, 236, 244, 255];
+    });
+}
+window.makeTexture = makeTexture;
+window.textureFromImage = textureFromImage;
 window.createSim = () => {
     const sun = new Mass(1000000, [255, 210, 40, 255]);
     sun.reflectivity = 0.45;
+    sun.texture = makeTexture(128, 128, (x, y) => {
+        const grain = texNoise(x / 14, y / 14);
+        const fine = texNoise(x / 5, y / 5);
+        const hot = grain * 0.75 + fine * 0.25;
+        return [150 + hot * 105, 40 + hot * 170, 10 + hot * 50, 255];
+    });
     const G = 6.67408e-7;
     const bodies = [sun];
     const orbits = [
@@ -709,6 +874,7 @@ window.createSim = () => {
         const speed = Math.sqrt(G * sun.mass / distance);
         const body = new Mass(mass, color, [distance, 0, 0], [0, speed, 0]);
         body.reflectivity = reflectivity;
+        body.texture = planetTexture(i);
         bodies.push(body);
     }
     // Moon of the outer planet. A uniform-density planet this close to the sun
@@ -728,6 +894,21 @@ window.createSim = () => {
     const moonSpeed = Math.sqrt(G * host.mass / moonDist);
     bodies.push(new Mass(moonMass, [150, 230, 255, 255], [host.position[0] + moonDist, host.position[1], 0], [0, host.velocity[1] + moonSpeed, 0]));
     bodies[bodies.length - 1].reflectivity = 0.6;
+    bodies[bodies.length - 1].texture = makeTexture(128, 128, (x, y) => {
+        let shade = 168;
+        const craters = [[36, 40, 22], [88, 74, 16], [28, 96, 12], [78, 28, 10], [60, 60, 7]];
+        for (let i = 0; i < craters.length; i++) {
+            const dx = x - craters[i][0];
+            const dy = y - craters[i][1];
+            const d = Math.sqrt(dx * dx + dy * dy);
+            const r = craters[i][2];
+            if (d < r)
+                shade = 96;
+            else if (d < r + 3)
+                shade = 214;
+        }
+        return [shade, shade + 8, shade + 18, 255];
+    });
     const state = createUniverse(bodies);
     // v is distance per sim-step and G is tiny, so 1 step/second barely crawls.
     // 900 puts the inner orbit at about 8 seconds.
