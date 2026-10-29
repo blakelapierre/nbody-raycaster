@@ -193,38 +193,54 @@ const intersects = (ray, object) => {
         default: return;
     }
 };
-const getColorContribution = (ray, object) => {
-    let intersection = intersects(ray, object);
-    if (intersection)
-        return intersection.getColor();
-};
-const bias = 10;
-const cast = (vector, scene, base) => {
-    const [a, b, c] = vector;
-    const ray = [a, b, c];
-    ray.origin = scene.camera.origin;
-    let bestColor = null;
-    let bestT = Infinity;
+const REFLECTION_STEPS = 4;
+const REFLECT_BIAS = 0.05;
+const traceRay = (dir, origin, scene, base, stepsLeft) => {
+    const ray = [dir[0], dir[1], dir[2]];
+    ray.origin = origin;
     const objects = scene.objects;
+    let bestSphere = null;
+    let bestPoint = null;
+    let bestT = Infinity;
     for (let i = 0; i < objects.length; i++) {
-        const hit = intersects(ray, objects[i]);
-        if (!hit)
+        const object = objects[i];
+        if (object[0] !== 'sphere')
             continue;
-        const delta = vDifference(ray.origin, hit.intersection);
-        const t = vLength(delta);
-        if (t < bestT) {
-            bestT = t;
-            bestColor = hit.getColor();
-        }
+        const intersection = sphereRayIntersection(object[1], ray);
+        if (!intersection)
+            continue;
+        const t = vLength(vDifference(origin, intersection));
+        if (t < REFLECT_BIAS * 0.4 || t >= bestT)
+            continue;
+        bestT = t;
+        bestSphere = object[1];
+        bestPoint = intersection;
     }
-    if (bestColor)
-        return bestColor;
-    return base || [
+    if (!bestSphere)
+        return base;
+    const color = bestSphere.color;
+    const reflectivity = stepsLeft > 0 ? Math.min(1, Math.max(0, bestSphere.reflectivity || 0)) : 0;
+    if (reflectivity <= 0)
+        return color;
+    const normal = vUnit(vDifference(bestSphere.origin, bestPoint));
+    const reflected = vUnit(vAdd(dir, vScale(normal, -2 * vDot(dir, normal))));
+    const bounced = traceRay(reflected, vAdd(bestPoint, vScale(normal, REFLECT_BIAS)), scene, base, stepsLeft - 1);
+    const keep = 1 - reflectivity;
+    return [
+        color[0] * keep + bounced[0] * reflectivity,
+        color[1] * keep + bounced[1] * reflectivity,
+        color[2] * keep + bounced[2] * reflectivity,
+        color[3]
+    ];
+};
+const cast = (vector, scene, base) => {
+    const miss = base || [
         Math.random(),
         Math.random(),
         Math.random(),
         1 - scene.camera.backgroundOpacity
     ];
+    return traceRay(vector, scene.camera.origin, scene, miss, REFLECTION_STEPS);
 };
 const qDetInner = ([a, b, c, d]) => ({
     [a + b]: [a, b],
@@ -425,39 +441,64 @@ void main() {
     float halfAngle = tan(uFov * 0.008726646259971648) * uPlane;
     vec3 rd = normalize(vec3((uu * 2.0 - 1.0) * uAspect * halfAngle, (1.0 - vv * 2.0) * halfAngle, uPlane));
     rd = rotateByQ(rd, uQ);
-    vec4 bestColor = vec4(0.0, 0.0, 0.0, 1.0);
-    float bestT = 1.0e30;
-    for (int i = 0; i < ${MAX_SPHERES}; i++) {
-        if (i >= uCount)
-            break;
-        vec4 sphere = texelFetch(uSpheres, ivec2(i, 0), 0);
-        vec3 oc = sphere.xyz - uOrigin;
-        float a = dot(rd, rd);
-        float b = dot(rd, oc);
-        float c = dot(oc, oc) - sphere.w * sphere.w;
-        float delta = b * b - a * c;
-        if (a == 0.0 || delta < 0.0)
-            continue;
-        float root = sqrt(delta);
-        float t = (b - root) / a;
-        if (t < 0.0)
-            t = (b + root) / a;
-        if (t < 0.0)
-            continue;
-        vec3 hit = uOrigin + rd * t;
-        float dist = length(hit - uOrigin);
-        if (dist < bestT) {
+    vec3 ro = uOrigin;
+    vec3 accum = vec3(0.0);
+    float thru = 1.0;
+    for (int bounce = 0; bounce < 5; bounce++) {
+        float bestT = 1.0e30;
+        vec3 hitP = ro;
+        vec3 hitC = ro;
+        vec3 hitRgb = vec3(0.0);
+        float hitRef = 0.0;
+        bool found = false;
+        for (int i = 0; i < ${MAX_SPHERES}; i++) {
+            if (i >= uCount)
+                break;
+            vec4 sphere = texelFetch(uSpheres, ivec2(i, 0), 0);
+            vec3 oc = sphere.xyz - ro;
+            float a = dot(rd, rd);
+            float b = dot(rd, oc);
+            float c = dot(oc, oc) - sphere.w * sphere.w;
+            float delta = b * b - a * c;
+            if (a == 0.0 || delta < 0.0)
+                continue;
+            float root = sqrt(delta);
+            float t = (b - root) / a;
+            if (t < 0.0)
+                t = (b + root) / a;
+            if (t < 0.0)
+                continue;
+            vec3 at = ro + rd * t;
+            float dist = length(at - ro);
+            if (dist < 0.02 || dist >= bestT)
+                continue;
             bestT = dist;
-            bestColor = texelFetch(uColors, ivec2(i, 0), 0);
+            hitP = at;
+            hitC = sphere.xyz;
+            vec4 col = texelFetch(uColors, ivec2(i, 0), 0);
+            hitRgb = col.rgb;
+            hitRef = col.a;
+            found = true;
         }
+        if (!found)
+            break;
+        float mirror = bounce == 4 ? 0.0 : clamp(hitRef, 0.0, 1.0);
+        accum += thru * hitRgb * (1.0 - mirror);
+        thru *= mirror;
+        if (thru <= 0.0)
+            break;
+        vec3 n = normalize(hitP - hitC);
+        rd = normalize(reflect(rd, n));
+        ro = hitP + n * 0.05;
     }
-    fragColor = bestColor;
+    fragColor = vec4(accum, 1.0);
 }`;
     const compile = (type, src) => {
         const shader = gl.createShader(type);
         gl.shaderSource(shader, src);
         gl.compileShader(shader);
         if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            console.error(gl.getShaderInfoLog(shader));
             gl.deleteShader(shader);
             return null;
         }
@@ -472,8 +513,10 @@ void main() {
     gl.attachShader(program, fs);
     gl.bindAttribLocation(program, 0, 'aPos');
     gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error(gl.getProgramInfoLog(program));
         return null;
+    }
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
@@ -519,7 +562,7 @@ void main() {
                 gpuColorData[i * 4] = color[0];
                 gpuColorData[i * 4 + 1] = color[1];
                 gpuColorData[i * 4 + 2] = color[2];
-                gpuColorData[i * 4 + 3] = color[3];
+                gpuColorData[i * 4 + 3] = sphere.reflectivity || 0;
             }
             const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
             gl.useProgram(program);
@@ -622,7 +665,8 @@ function syncSceneObjects(scene) {
         objects.push(['sphere', {
             radius: mass.size,
             origin: mass.position,
-            color: [c[0] / 255, c[1] / 255, c[2] / 255, c[3] > 1 ? c[3] / 255 : c[3]]
+            color: [c[0] / 255, c[1] / 255, c[2] / 255, c[3] > 1 ? c[3] / 255 : c[3]],
+            reflectivity: mass.reflectivity || 0
         }]);
     }
     scene.objects = objects;
@@ -651,18 +695,21 @@ function syncCameraInputs() {
 }
 window.createSim = () => {
     const sun = new Mass(1000000, [255, 210, 40, 255]);
+    sun.reflectivity = 0.45;
     const G = 6.67408e-7;
     const bodies = [sun];
     const orbits = [
-        [sun.size + 50, 10, [70, 130, 255, 255]],
-        [sun.size + 110, 14, [220, 80, 50, 255]],
-        [sun.size + 260, 12, [230, 230, 235, 255]]
+        [sun.size + 50, 10, [70, 130, 255, 255], 0.35],
+        [sun.size + 110, 14, [220, 80, 50, 255], 0.55],
+        [sun.size + 260, 12, [230, 230, 235, 255], 0.8]
     ];
     for (let i = 0; i < orbits.length; i++) {
-        const [distance, radius, color] = orbits[i];
+        const [distance, radius, color, reflectivity] = orbits[i];
         const mass = (4 / 3) * Math.PI * radius * radius * radius;
         const speed = Math.sqrt(G * sun.mass / distance);
-        bodies.push(new Mass(mass, color, [distance, 0, 0], [0, speed, 0]));
+        const body = new Mass(mass, color, [distance, 0, 0], [0, speed, 0]);
+        body.reflectivity = reflectivity;
+        bodies.push(body);
     }
     // Moon of the outer planet. A uniform-density planet this close to the sun
     // fills its own hill sphere, so the host is denser than it looks.
@@ -680,6 +727,7 @@ window.createSim = () => {
     const moonDist = 28;
     const moonSpeed = Math.sqrt(G * host.mass / moonDist);
     bodies.push(new Mass(moonMass, [150, 230, 255, 255], [host.position[0] + moonDist, host.position[1], 0], [0, host.velocity[1] + moonSpeed, 0]));
+    bodies[bodies.length - 1].reflectivity = 0.6;
     const state = createUniverse(bodies);
     // v is distance per sim-step and G is tiny, so 1 step/second barely crawls.
     // 900 puts the inner orbit at about 8 seconds.
