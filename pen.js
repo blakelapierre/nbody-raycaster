@@ -1,8 +1,8 @@
 // @ts-nocheck
 "use strict";
 const canvasParams = {
-    width: 160,
-    height: 90
+    width: 960,
+    height: 540
 };
 const viewParams = {
     pointsPerRender: 100,
@@ -296,6 +296,11 @@ const attachView = el => {
     const canvas = createCanvas(el);
     canvas.width = canvasParams.width;
     canvas.height = canvasParams.height;
+    gpuPainter = createGpuPainter(canvas);
+    if (gpuPainter)
+        canvas.dataset.renderer = 'webgl2';
+    else
+        context = canvas.getContext('2d');
     el.append(canvas);
     const saveCanvasData = canvas => {
         const context = canvas.getContext('2d');
@@ -316,8 +321,10 @@ const attachView = el => {
             }
         }
     };
-    const { input } = addPropertyControl(el, () => canvas, () => 'width', saveCanvasData, restoreCanvasData, 1, 300);
-    addPropertyControl(el, () => canvas, () => 'height', saveCanvasData, restoreCanvasData, 1, 300);
+    const resizeBefore = gpuPainter ? undefined : saveCanvasData;
+    const resizeAfter = gpuPainter ? undefined : restoreCanvasData;
+    const { input } = addPropertyControl(el, () => canvas, () => 'width', resizeBefore, resizeAfter, 1, 1920);
+    addPropertyControl(el, () => canvas, () => 'height', resizeBefore, resizeAfter, 1, 1920);
     addPropertyControl(el, () => viewParams, () => 'pointsPerRender', undefined, undefined, 1, 10000);
     addPropertyControl(el, () => scene.camera, () => 'fov');
     tagCam(addPropertyControl(el, () => scene.camera.origin, () => 0, undefined, undefined, -400, 400, 0.01), 0);
@@ -343,6 +350,7 @@ const attachView = el => {
 let canvas;
 let stateView;
 let context;
+let gpuPainter;
 const render = (points, scene) => {
     const data = {};
     for (let i = 0; i < points; i++) {
@@ -375,7 +383,171 @@ const paint = (data, context) => {
     });
 };
 let frame;
+const MAX_SPHERES = 64;
+const gpuSphereData = new Float32Array(MAX_SPHERES * 4);
+const gpuColorData = new Float32Array(MAX_SPHERES * 4);
+function createGpuPainter(canvas) {
+    const gl = canvas.getContext('webgl2', {
+        alpha: false,
+        antialias: false,
+        depth: false,
+        stencil: false,
+        preserveDrawingBuffer: true
+    });
+    if (!gl)
+        return null;
+    const vert = `#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
+    // Same rays as project(), same quadratic as sphereRayIntersection(), closest hit wins.
+    const fragSrc = `#version 300 es
+precision highp float;
+uniform vec3 uOrigin;
+uniform vec4 uQ;
+uniform float uFov;
+uniform float uAspect;
+uniform float uPlane;
+uniform vec2 uRes;
+uniform int uCount;
+uniform sampler2D uSpheres;
+uniform sampler2D uColors;
+out vec4 fragColor;
+vec3 rotateByQ(vec3 v, vec4 q) {
+    float a = q.x;
+    vec3 qv = q.yzw;
+    return qv * (2.0 * dot(qv, v))
+        + v * (a * a - dot(qv, qv))
+        + cross(qv, v) * (2.0 * a);
+}
+void main() {
+    float uu = gl_FragCoord.x / uRes.x;
+    float vv = 1.0 - gl_FragCoord.y / uRes.y;
+    float halfAngle = tan(uFov * 0.008726646259971648) * uPlane;
+    vec3 rd = normalize(vec3((uu * 2.0 - 1.0) * uAspect * halfAngle, (1.0 - vv * 2.0) * halfAngle, uPlane));
+    rd = rotateByQ(rd, uQ);
+    vec4 bestColor = vec4(0.0, 0.0, 0.0, 1.0);
+    float bestT = 1.0e30;
+    for (int i = 0; i < ${MAX_SPHERES}; i++) {
+        if (i >= uCount)
+            break;
+        vec4 sphere = texelFetch(uSpheres, ivec2(i, 0), 0);
+        vec3 oc = sphere.xyz - uOrigin;
+        float a = dot(rd, rd);
+        float b = dot(rd, oc);
+        float c = dot(oc, oc) - sphere.w * sphere.w;
+        float delta = b * b - a * c;
+        if (a == 0.0 || delta < 0.0)
+            continue;
+        float root = sqrt(delta);
+        float t = (b - root) / a;
+        if (t < 0.0)
+            t = (b + root) / a;
+        if (t < 0.0)
+            continue;
+        vec3 hit = uOrigin + rd * t;
+        float dist = length(hit - uOrigin);
+        if (dist < bestT) {
+            bestT = dist;
+            bestColor = texelFetch(uColors, ivec2(i, 0), 0);
+        }
+    }
+    fragColor = bestColor;
+}`;
+    const compile = (type, src) => {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, src);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            gl.deleteShader(shader);
+            return null;
+        }
+        return shader;
+    };
+    const vs = compile(gl.VERTEX_SHADER, vert);
+    const fs = compile(gl.FRAGMENT_SHADER, fragSrc);
+    if (!vs || !fs)
+        return null;
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.bindAttribLocation(program, 0, 'aPos');
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+        return null;
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const sphereTex = gl.createTexture();
+    const colorTex = gl.createTexture();
+    const alloc = (tex, unit) => {
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_SPHERES, 1, 0, gl.RGBA, gl.FLOAT, null);
+    };
+    alloc(sphereTex, 0);
+    alloc(colorTex, 1);
+    const loc = name => gl.getUniformLocation(program, name);
+    const uOrigin = loc('uOrigin');
+    const uQ = loc('uQ');
+    const uFov = loc('uFov');
+    const uAspect = loc('uAspect');
+    const uPlane = loc('uPlane');
+    const uRes = loc('uRes');
+    const uCount = loc('uCount');
+    gl.useProgram(program);
+    gl.uniform1i(loc('uSpheres'), 0);
+    gl.uniform1i(loc('uColors'), 1);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    return {
+        gl,
+        paint(scene) {
+            const objects = scene.objects;
+            const count = Math.min(objects.length, MAX_SPHERES);
+            for (let i = 0; i < count; i++) {
+                const sphere = objects[i][1];
+                const o = sphere.origin;
+                const color = sphere.color;
+                gpuSphereData[i * 4] = o[0];
+                gpuSphereData[i * 4 + 1] = o[1];
+                gpuSphereData[i * 4 + 2] = o[2];
+                gpuSphereData[i * 4 + 3] = sphere.radius;
+                gpuColorData[i * 4] = color[0];
+                gpuColorData[i * 4 + 1] = color[1];
+                gpuColorData[i * 4 + 2] = color[2];
+                gpuColorData[i * 4 + 3] = color[3];
+            }
+            const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
+            gl.useProgram(program);
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, sphereTex);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuSphereData);
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, colorTex);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuColorData);
+            gl.uniform3f(uOrigin, scene.camera.origin[0], scene.camera.origin[1], scene.camera.origin[2]);
+            gl.uniform4f(uQ, q[0], q[1], q[2], q[3]);
+            gl.uniform1f(uFov, scene.camera.fov);
+            gl.uniform1f(uAspect, scene.camera.aspect);
+            gl.uniform1f(uPlane, scene.camera.planeDistance);
+            gl.uniform2f(uRes, canvas.width, canvas.height);
+            gl.uniform1i(uCount, count);
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            return true;
+        }
+    };
+}
 const paintFrame = (scene, context) => {
+    if (gpuPainter && gpuPainter.paint(scene))
+        return;
     const w = context.canvas.width;
     const h = context.canvas.height;
     if (!frame || frame.width !== w || frame.height !== h)
@@ -1131,14 +1303,16 @@ export function boot(root) {
     const view = attachView(el);
     canvas = view.canvas;
     stateView = view.stateView;
-    const ctx = canvas.getContext('2d');
-    if (!ctx)
-        return;
-    context = ctx;
-    context.imageSmoothingEnabled = false;
-    const legacy = /** @type {any} */ (ctx);
-    legacy.mozImageSmoothingEnabled = false;
-    legacy.webkitImageSmoothingEnabled = false;
+    if (!gpuPainter) {
+        const ctx = canvas.getContext('2d');
+        if (!ctx)
+            return;
+        context = ctx;
+        context.imageSmoothingEnabled = false;
+        const legacy = /** @type {any} */ (ctx);
+        legacy.mozImageSmoothingEnabled = false;
+        legacy.webkitImageSmoothingEnabled = false;
+    }
     paintedCam = '';
     viewParams.running = true;
     const button = el.querySelector('button');
