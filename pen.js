@@ -846,6 +846,60 @@ void main() {
         return count;
     };
     let fence = null;
+    const timerExt = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    let rayQuery = null;
+    let rayQueryRays = 0;
+    let rayQueryAt = 0;
+    const beginRayQuery = () => {
+        if (!timerExt || rayQuery)
+            return false;
+        try {
+            rayQuery = gl.createQuery();
+            gl.beginQuery(timerExt.TIME_ELAPSED_EXT, rayQuery);
+            rayQueryAt = performance.now();
+            return true;
+        }
+        catch (err) {
+            rayQuery = null;
+            return false;
+        }
+    };
+    const endRayQuery = (rays) => {
+        if (!timerExt || !rayQuery)
+            return;
+        try {
+            gl.endQuery(timerExt.TIME_ELAPSED_EXT);
+            rayQueryRays = rays;
+        }
+        catch (err) {
+            try { gl.deleteQuery(rayQuery); } catch (ignore) { /* already gone */ }
+            rayQuery = null;
+        }
+    };
+    const takeRayTiming = () => {
+        if (!timerExt || !rayQuery)
+            return null;
+        try {
+            if (gl.getParameter(timerExt.GPU_DISJOINT_EXT)) {
+                gl.deleteQuery(rayQuery);
+                rayQuery = null;
+                return null;
+            }
+            if (!gl.getQueryParameter(rayQuery, gl.QUERY_RESULT_AVAILABLE))
+                return null;
+            const ns = gl.getQueryParameter(rayQuery, gl.QUERY_RESULT);
+            const rays = rayQueryRays;
+            gl.deleteQuery(rayQuery);
+            rayQuery = null;
+            if (!(ns > 0))
+                return null;
+            return { rays, ms: ns / 1e6, gpu: true };
+        }
+        catch (err) {
+            rayQuery = null;
+            return null;
+        }
+    };
     const gpuPending = () => {
         if (!fence)
             return false;
@@ -904,7 +958,10 @@ void main() {
         gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        const queried = beginRayQuery();
         gl.drawArrays(gl.TRIANGLES, 0, 3);
+        if (queried)
+            endRayQuery(tw * th);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.useProgram(blitProgram);
@@ -953,6 +1010,9 @@ void main() {
         paintFit,
         pending: gpuPending,
         mark: gpuMark,
+        takeRayTiming,
+        rayTimingPending: () => !!rayQuery,
+        hasRayTimer: () => !!timerExt,
         paintRandom(scene, count) {
             const n = Math.max(0, Math.min(count, rayUVs.length / 2));
             if (!n)
@@ -1116,6 +1176,12 @@ const sizeForPixels = (pixels, target) => {
         h -= 1;
     return { w: Math.max(16, w), h: Math.max(16, h) };
 };
+const noteRayRate = (rays, ms) => {
+    if (!(rays > 0) || !(ms > 0.05))
+        return;
+    const rate = rays / (ms / 1000);
+    adaptive.raysPerSec = adaptive.raysPerSec ? adaptive.raysPerSec * 0.4 + rate * 0.6 : rate;
+};
 const paintAdaptive = (scene) => {
     const target = nativeSize(canvas);
     const nativePx = Math.max(1, target.w * target.h);
@@ -1126,21 +1192,60 @@ const paintAdaptive = (scene) => {
     }
     if (!(adaptive.cap > 0))
         adaptive.cap = Math.min(nativePx, 140000);
-    const dt = adaptive.frameDt || 0;
-    const settled = adaptive.frames > 12;
-    if (settled && dt > 120) {
-        adaptive.ceiling = adaptive.good || Math.max(90000, adaptive.cap * 0.7);
-        adaptive.cap = adaptive.ceiling;
-        adaptive.holdUntil = performance.now() + 2000;
+    const budgetMs = Math.min(28, Math.max(10, (adaptive.refresh || 33) * 0.85));
+    const sample = gpuPainter && gpuPainter.takeRayTiming && gpuPainter.takeRayTiming();
+    let spare = false;
+    if (sample) {
+        noteRayRate(sample.rays, sample.ms);
+        spare = sample.ms < budgetMs * 0.75;
     }
-    else if (settled && dt > 0 && dt < 42 && performance.now() > (adaptive.holdUntil || 0)) {
-        adaptive.good = adaptive.cap;
-        const limit = Math.min(nativePx, adaptive.ceiling > 0 ? adaptive.ceiling : nativePx);
-        if (adaptive.cap < limit * 0.98 && performance.now() - (adaptive.lastGrow || 0) > 450) {
-            adaptive.cap = Math.min(limit, adaptive.cap * 1.1);
-            adaptive.lastGrow = performance.now();
+    else if (adaptive.submittedRays > 0) {
+        const dt = adaptive.frameDt || 0;
+        if (dt > 70) {
+            noteRayRate(adaptive.submittedRays, dt);
+            if (adaptive.good)
+                adaptive.ceiling = adaptive.good;
+            spare = false;
+        }
+        else {
+        const busy = !!(gpuPainter && gpuPainter.pending && gpuPainter.pending());
+        const elapsed = Math.max(0, performance.now() - (adaptive.submittedAt || performance.now()));
+        if (busy)
+            adaptive.pendingCount = (adaptive.pendingCount || 0) + 1;
+        else
+            adaptive.pendingCount = 0;
+        const fenceStuck = adaptive.pendingCount > 4;
+        if (!fenceStuck && busy) {
+            // The batch is still on the GPU, so this duration is a ceiling on the rate.
+            noteRayRate(adaptive.submittedRays, Math.max(elapsed, budgetMs));
+            spare = false;
+        }
+        else if (fenceStuck && dt > 70) {
+            noteRayRate(adaptive.submittedRays, dt);
+            spare = false;
+        }
+        else if (elapsed > 0.5) {
+            // It finished before we looked. rays/elapsed is only a lower bound, so step up and let the next overrun correct it.
+            const floor = adaptive.submittedRays / (elapsed / 1000);
+            if (!(adaptive.raysPerSec > floor))
+                adaptive.raysPerSec = floor;
+            spare = true;
+        }
         }
     }
+    let affordable = spare
+        ? Math.min(nativePx, Math.max(adaptive.cap * 2, (adaptive.raysPerSec || 0) * (budgetMs / 1000)))
+        : (adaptive.raysPerSec > 0
+            ? adaptive.raysPerSec * (budgetMs / 1000)
+            : adaptive.cap);
+    if (spare)
+        adaptive.good = adaptive.cap;
+    if (adaptive.ceiling > 0)
+        affordable = Math.min(affordable, adaptive.ceiling);
+    affordable = Math.max(16000, Math.min(nativePx, affordable));
+    if (adaptive.cap > 0)
+        affordable = Math.max(adaptive.cap * 0.5, Math.min(adaptive.cap * 2, affordable));
+    adaptive.cap = affordable;
     const size = sizeForPixels(adaptive.cap, target);
     adaptive.cap = size.w * size.h;
     adaptive.traceW = size.w;
@@ -1152,6 +1257,10 @@ const paintAdaptive = (scene) => {
         gpuPainter.paint(scene);
     else if (context)
         paintRandomCPU(scene, Math.min(adaptive.rays, size.w * size.h));
+    adaptive.submittedRays = size.w * size.h;
+    adaptive.submittedAt = performance.now();
+    if (gpuPainter && gpuPainter.mark)
+        gpuPainter.mark();
     adaptive.samples += size.w * size.h;
 };
 const tuneAdaptive = (paintMs) => {
@@ -1211,8 +1320,13 @@ const animate = (stamp) => {
         const tw = adaptive.traceW || canvas.width;
         const th = adaptive.traceH || canvas.height;
         const atWindow = Math.abs(tw - target.w) <= 8 && Math.abs(th - target.h) <= 8;
+        const rate = adaptive.raysPerSec || 0;
+        const rateText = rate >= 1e6 ? (rate / 1e6).toFixed(1) + 'M/s'
+            : rate >= 1000 ? Math.round(rate / 1000) + 'k/s'
+            : rate > 0 ? Math.round(rate) + '/s' : '';
         stateView.innerText = tw + '×' + th
             + (atWindow ? '' : ' / ' + target.w + '×' + target.h)
+            + (rateText ? '  ' + rateText : '')
             + '  ' + Math.round(adaptive.frameDt || adaptive.paintMs || 0) + 'ms  '
             + (scale > 0 ? scale + '×' : 'paused')
             + '  ' + bodies;
