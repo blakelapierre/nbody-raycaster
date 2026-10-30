@@ -20,14 +20,14 @@ root .view-frame {
   position: sticky;
   top: 0;
   z-index: 1;
-  width: min(100%, calc(58vh * 16 / 9));
+  width: min(100%, calc(72vh * 16 / 9));
+  aspect-ratio: 16 / 9;
   margin: 0 auto;
 }
 root canvas.view {
   display: block;
   width: 100%;
-  height: auto;
-  max-height: 58vh;
+  height: 100%;
   image-rendering: pixelated;
   background: #000;
 }

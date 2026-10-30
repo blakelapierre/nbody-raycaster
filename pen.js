@@ -1060,24 +1060,22 @@ const sizeForPixels = (pixels, target) => {
     return { w: Math.max(16, w), h: Math.max(16, h) };
 };
 const paintAdaptive = (scene) => {
-    const target = nativeSize(canvas);
-    scene.camera.aspect = target.w / target.h;
-    const nativePx = target.w * target.h;
-    // A larger frame blocks the preview for seconds. Stay small enough to finish.
-    if (!(adaptive.cap > 0))
-        adaptive.cap = Math.min(nativePx, 100000);
-    const size = sizeForPixels(adaptive.cap, target);
-    adaptive.cap = size.w * size.h;
-    adaptive.level = Math.max(0, Math.min(8, Math.round(Math.log2(nativePx / Math.max(1, adaptive.cap)))));
-    if (canvas.width !== size.w || canvas.height !== size.h)
-        applySize(size.w, size.h, 'upscale');
+    const rect = canvas.getBoundingClientRect();
+    scene.camera.aspect = rect.width > 2 && rect.height > 2 ? rect.width / rect.height : 16 / 9;
+    // The window only scales this buffer. Resizing it to the window stalls the GPU.
+    const w = 480;
+    const h = 270;
+    adaptive.cap = w * h;
+    adaptive.level = 0;
+    if (canvas.width !== w || canvas.height !== h)
+        applySize(w, h, 'clear');
     let castN = 0;
     if (gpuPainter) {
         gpuPainter.paint(scene);
-        castN = canvas.width * canvas.height;
+        castN = w * h;
     }
     else if (context)
-        castN = paintRandomCPU(scene, Math.min(adaptive.rays, canvas.width * canvas.height));
+        castN = paintRandomCPU(scene, Math.min(adaptive.rays, w * h));
     adaptive.samples += castN;
 };
 const tuneAdaptive = (paintMs) => {
@@ -1245,7 +1243,7 @@ function paintTrails() {
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(2, Math.round(rect.width));
     const h = Math.max(2, Math.round(rect.height));
-    if (trailCanvas.width !== w || trailCanvas.height !== h) {
+    if (Math.abs(trailCanvas.width - w) > 8 || Math.abs(trailCanvas.height - h) > 8) {
         trailCanvas.width = w;
         trailCanvas.height = h;
     }
