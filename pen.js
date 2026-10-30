@@ -6,7 +6,10 @@ const canvasParams = {
 };
 const viewParams = {
     pointsPerRender: 2000000,
-    running: false
+    running: false,
+    timeScale: 1,
+    savedScale: 1,
+    preset: 'system'
 };
 const resCap = { width: 3840, height: 2160 };
 const adaptive = {
@@ -376,26 +379,70 @@ const attachView = el => {
     };
     const resizeBefore = gpuPainter ? undefined : saveCanvasData;
     const resizeAfter = gpuPainter ? undefined : restoreCanvasData;
-    const { input } = addPropertyControl(el, () => resCap, () => 'width', undefined, undefined, 1, 3840);
-    addPropertyControl(el, () => resCap, () => 'height', undefined, undefined, 1, 3840);
-    addPropertyControl(el, () => viewParams, () => 'pointsPerRender', undefined, undefined, 1, 2000000);
-    addPropertyControl(el, () => scene.camera, () => 'fov');
-    tagCam(addPropertyControl(el, () => scene.camera.origin, () => 0, undefined, undefined, -400, 400, 0.01), 0);
-    tagCam(addPropertyControl(el, () => scene.camera.origin, () => 1, undefined, undefined, -400, 400, 0.01), 1);
-    tagCam(addPropertyControl(el, () => scene.camera.origin, () => 2, undefined, undefined, -400, 400, 0.01), 2);
-    addPropertyControl(el, () => scene.camera, () => 'backgroundOpacity', undefined, undefined, 0, 1, 0.01);
-    const pauseButton = document.createElement('button');
-    pauseButton.innerText = viewParams.running ? 'Pause' : 'Resume';
-    pauseButton.addEventListener('click', () => {
-        viewParams.running = !viewParams.running;
-        pauseButton.innerText = viewParams.running ? 'Pause' : 'Resume';
+    const frame = document.createElement('div');
+    frame.className = 'view-frame';
+    canvas.className = 'view';
+    const overlay = document.createElement('canvas');
+    overlay.className = 'trails';
+    frame.append(canvas, overlay);
+    el.append(frame);
+    trailCanvas = overlay;
+    trailCtx = overlay.getContext('2d');
+    canvas.addEventListener('click', event => spawnFromClick(event));
+    const bar = document.createElement('div');
+    bar.className = 'row';
+    const presets = [['system', 'System'], ['binary', 'Binary'], ['pair', 'Pair']];
+    for (let i = 0; i < presets.length; i++) {
+        const button = document.createElement('button');
+        button.innerText = presets[i][1];
+        button.addEventListener('click', () => loadPreset(presets[i][0]));
+        bar.append(button);
+    }
+    const timeLabel = document.createElement('span');
+    timeLabel.className = 'tag';
+    timeLabel.textContent = 'time';
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '20';
+    slider.step = '0.5';
+    slider.value = String(viewParams.timeScale);
+    const read = document.createElement('span');
+    read.className = 'tag';
+    const syncScale = () => {
+        read.textContent = viewParams.timeScale > 0 ? viewParams.timeScale + '×' : 'paused';
+    };
+    slider.addEventListener('input', () => {
+        viewParams.timeScale = parseFloat(slider.value) || 0;
+        if (viewParams.timeScale > 0)
+            viewParams.savedScale = viewParams.timeScale;
+        syncScale();
+        pauseButton.innerText = viewParams.timeScale > 0 ? 'Pause' : 'Resume';
     });
-    el.append(pauseButton);
+    const pauseButton = document.createElement('button');
+    pauseButton.className = 'pause';
+    pauseButton.innerText = 'Pause';
+    pauseButton.addEventListener('click', () => {
+        if (viewParams.timeScale > 0) {
+            viewParams.savedScale = viewParams.timeScale;
+            viewParams.timeScale = 0;
+        }
+        else
+            viewParams.timeScale = viewParams.savedScale || 1;
+        slider.value = String(viewParams.timeScale);
+        syncScale();
+        pauseButton.innerText = viewParams.timeScale > 0 ? 'Pause' : 'Resume';
+    });
+    syncScale();
+    bar.append(timeLabel, slider, read, pauseButton);
+    el.append(bar);
     const stateView = document.createElement('state-view');
     el.append(stateView);
-    return { canvas, stateView, input };
+    return { canvas, stateView, input: slider };
 };
 let canvas;
+let trailCanvas;
+let trailCtx;
 let stateView;
 let context;
 let gpuPainter;
@@ -577,6 +624,36 @@ void main() {
             break;
         vec3 nrm = normalize(hitP - hitC);
         vec3 hitRgb = albedo(nrm, bestI);
+        if (bounce == 0 && bestI != 0 && uCount > 0) {
+            vec4 sun = texelFetch(uSpheres, ivec2(0, 0), 0);
+            vec3 toL = sun.xyz - hitP;
+            float distL = length(toL);
+            vec3 ld = toL / max(distL, 1.0e-4);
+            float ndl = dot(nrm, ld);
+            float shade = ndl < 0.0 ? 0.34 : 1.0;
+            vec3 sro = hitP + ld * 0.05;
+            float lightT = distL - sun.w - 0.05;
+            for (int j = 1; j < ${MAX_SPHERES}; j++) {
+                if (j >= uCount)
+                    break;
+                vec4 sph = texelFetch(uSpheres, ivec2(j, 0), 0);
+                vec3 soc = sph.xyz - sro;
+                float sb = dot(ld, soc);
+                float sc = dot(soc, soc) - sph.w * sph.w;
+                float sd = sb * sb - sc;
+                if (sd < 0.0)
+                    continue;
+                float sroot = sqrt(sd);
+                float st = sb - sroot;
+                if (st < 0.0)
+                    st = sb + sroot;
+                if (st > 0.02 && st < lightT) {
+                    shade = min(shade, 0.28);
+                    break;
+                }
+            }
+            hitRgb *= shade;
+        }
         float mirror = bounce == 4 ? 0.0 : clamp(hitRef, 0.0, 1.0);
         accum += thru * hitRgb * (1.0 - mirror);
         thru *= mirror;
@@ -986,13 +1063,26 @@ const paintAdaptive = (scene) => {
     const target = nativeSize(canvas);
     scene.camera.aspect = target.w / target.h;
     const nativePx = target.w * target.h;
-    // Stay on one size. Growing or skipping frames left the preview looking frozen.
     if (!(adaptive.cap > 0))
-        adaptive.cap = Math.min(nativePx, 160000);
+        adaptive.cap = Math.min(nativePx, 140000);
+    const dt = adaptive.frameDt || 0;
+    const work = adaptive.paintMs || 0;
+    const late = adaptive.frames > 3 && (dt > 55 || work > 26);
+    const easy = adaptive.frames > 3 && work > 0 && work < 14 && dt > 0 && dt < 48;
+    if (late && performance.now() > (adaptive.holdUntil || 0)) {
+        adaptive.cap = Math.max(70000, adaptive.cap * 0.62);
+        adaptive.ceiling = adaptive.cap;
+        adaptive.holdUntil = performance.now() + 1200;
+    }
+    else if (easy && performance.now() > (adaptive.holdUntil || 0)) {
+        const limit = Math.min(nativePx, adaptive.ceiling || nativePx);
+        if (adaptive.cap < limit * 0.98)
+            adaptive.cap = Math.min(limit, adaptive.cap * 1.05);
+    }
     const size = sizeForPixels(adaptive.cap, target);
     adaptive.cap = size.w * size.h;
     adaptive.level = Math.max(0, Math.min(8, Math.round(Math.log2(nativePx / Math.max(1, adaptive.cap)))));
-    if (canvas.width !== size.w || canvas.height !== size.h)
+    if (canvas.width < 2 || Math.abs(canvas.width - size.w) / canvas.width > 0.18)
         applySize(size.w, size.h, 'upscale');
     let castN = 0;
     if (gpuPainter) {
@@ -1053,13 +1143,15 @@ const animate = (stamp) => {
             adaptive.lastStamp = stamp;
         tuneAdaptive(paintMs);
         adaptive.elapsed = elapsed;
-        const universe = scene.simState.universe;
-        stateView.innerText = JSON.stringify({
-            cam: scene.camera.origin.map(v => Math.round(v)),
-            px: [canvas.width, canvas.height],
-            lvl: adaptive.level,
-            bodies: universe.map(m => [Math.round(m.size), m.position.map(v => Math.round(v))])
-        });
+        sampleTrails();
+        paintTrails();
+        const scale = viewParams.timeScale;
+        const bodies = scene.simState.universe.length;
+        stateView.innerText = canvas.width + '×' + canvas.height
+            + '  lvl ' + adaptive.level
+            + '  ' + Math.round(adaptive.frameDt || adaptive.paintMs || 0) + 'ms  '
+            + (scale > 0 ? scale + '×' : 'paused')
+            + '  ' + bodies;
     }
     catch (err) {
         if (stateView)
@@ -1075,10 +1167,20 @@ function startLoop() {
 }
 function start() {
     started = true;
-    scene.simState = window.createSim();
+    scene.simState = window.createSim(viewParams.preset || 'system');
     frameCamera(scene);
     syncSceneObjects(scene);
     scene.runner = window.createRunner(scene.simState, new Clock(scene.simState), 1000 / 5, 1);
+}
+function loadPreset(kind) {
+    viewParams.preset = kind;
+    if (!started)
+        return;
+    scene.simState = window.createSim(kind);
+    adaptive.ceiling = 0;
+    scene.runner = window.createRunner(scene.simState, new Clock(scene.simState), 1000 / 5, 1);
+    frameCamera(scene);
+    syncSceneObjects(scene);
 }
 function syncSceneObjects(scene) {
     const universe = scene.simState && scene.simState.universe;
@@ -1100,16 +1202,139 @@ function syncSceneObjects(scene) {
 }
 function frameCamera(scene) {
     const universe = scene.simState.universe;
-    const sun = universe[0];
-    const host = universe.length > 3 ? universe[3] : sun;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < universe.length; i++) {
+        const mass = universe[i];
+        minX = Math.min(minX, mass.position[0] - mass.size);
+        maxX = Math.max(maxX, mass.position[0] + mass.size);
+        minY = Math.min(minY, mass.position[1] - mass.size);
+        maxY = Math.max(maxY, mass.position[1] + mass.size);
+    }
+    const midX = (minX + maxX) / 2;
+    const midY = (minY + maxY) / 2;
+    const span = Math.max(80, maxX - minX, maxY - minY);
     const half = Math.tan((scene.camera.fov * Math.PI / 180) / 2);
-    const span = half * scene.camera.aspect;
-    const x = host.position[0] * 0.55;
-    // Far enough that the sun and the outer planet both stay inside the frame.
-    const z = -Math.max(sun.size * 1.5, Math.abs(x) / (span * 0.78), Math.abs(host.position[0] - x) / (span * 0.72));
-    scene.camera.origin = [x, 8, z];
+    const wide = half * scene.camera.aspect;
+    const z = -Math.max(span / (wide * 1.35), span / (half * 1.35), 80);
+    scene.camera.origin = [midX, midY, z];
     scene.camera.dir = [0, 0, 1];
     syncCameraInputs();
+}
+function worldToScreen(point, camera, w, h) {
+    const rel = vDifference(camera.origin, point);
+    const q = qFromUnitVectors(vUnit(camera.dir), [0, 0, 1]);
+    const cam = rotateVectorByQ(rel, q);
+    if (cam[2] < 0.05)
+        return null;
+    const half = Math.tan((camera.fov * Math.PI / 180) / 2) * camera.planeDistance;
+    const px = cam[0] / cam[2] * camera.planeDistance;
+    const py = cam[1] / cam[2] * camera.planeDistance;
+    const u = (px / (camera.aspect * half) + 1) / 2;
+    const v = (1 - py / half) / 2;
+    return [u * w, v * h];
+}
+function sampleTrails() {
+    const bodies = scene.simState && scene.simState.universe;
+    if (!bodies)
+        return;
+    for (let i = 0; i < bodies.length; i++) {
+        const mass = bodies[i];
+        if (!mass.trail)
+            mass.trail = [];
+        const p = mass.position;
+        const last = mass.trail[mass.trail.length - 1];
+        if (!last || Math.hypot(p[0] - last[0], p[1] - last[1], p[2] - last[2]) > 0.35)
+            mass.trail.push([p[0], p[1], p[2]]);
+        if (mass.trail.length > 80)
+            mass.trail.shift();
+    }
+}
+function paintTrails() {
+    if (!trailCtx || !trailCanvas || !canvas)
+        return;
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(2, Math.round(rect.width));
+    const h = Math.max(2, Math.round(rect.height));
+    if (trailCanvas.width !== w || trailCanvas.height !== h) {
+        trailCanvas.width = w;
+        trailCanvas.height = h;
+    }
+    trailCtx.clearRect(0, 0, w, h);
+    const bodies = scene.simState && scene.simState.universe;
+    if (!bodies)
+        return;
+    trailCtx.lineWidth = 2;
+    trailCtx.lineJoin = 'round';
+    for (let i = 0; i < bodies.length; i++) {
+        const mass = bodies[i];
+        const trail = mass.trail;
+        if (!trail || trail.length < 2)
+            continue;
+        trailCtx.beginPath();
+        let moved = false;
+        for (let j = 0; j < trail.length; j++) {
+            const screen = worldToScreen(trail[j], scene.camera, w, h);
+            if (!screen) {
+                moved = false;
+                continue;
+            }
+            if (!moved)
+                trailCtx.moveTo(screen[0], screen[1]);
+            else
+                trailCtx.lineTo(screen[0], screen[1]);
+            moved = true;
+        }
+        const c = mass.color;
+        trailCtx.strokeStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.8)';
+        trailCtx.stroke();
+    }
+}
+function spawnFromClick(event) {
+    if (!scene.simState)
+        return;
+    const rect = canvas.getBoundingClientRect();
+    const u = (event.clientX - rect.left) / Math.max(1, rect.width);
+    const v = (event.clientY - rect.top) / Math.max(1, rect.height);
+    const dir = project(u, v, scene.camera);
+    if (Math.abs(dir[2]) < 1e-4)
+        return;
+    const origin = scene.camera.origin;
+    const t = -origin[2] / dir[2];
+    if (!(t > 0))
+        return;
+    const point = [origin[0] + dir[0] * t, origin[1] + dir[1] * t, 0];
+    const state = scene.simState;
+    let host = state.universe[0];
+    let nearest = Infinity;
+    for (let i = 0; i < state.universe.length; i++) {
+        const mass = state.universe[i];
+        const d = Math.hypot(point[0] - mass.position[0], point[1] - mass.position[1], point[2] - mass.position[2]);
+        if (d < mass.size * 1.15)
+            return;
+        if (d < nearest) {
+            nearest = d;
+            host = mass;
+        }
+    }
+    const relX = point[0] - host.position[0];
+    const relY = point[1] - host.position[1];
+    const dist = Math.hypot(relX, relY) || 1;
+    const speed = Math.sqrt(state.gravityConstant * host.mass / dist);
+    const tangent = Math.hypot(relY, relX) || 1;
+    const radius = 8;
+    const mass = (4 / 3) * Math.PI * radius * radius * radius;
+    const palette = [[180, 220, 120, 255], [255, 170, 70, 255], [170, 140, 255, 255], [255, 120, 170, 255]];
+    const body = new Mass(mass, palette[state.universe.length % palette.length], point, [
+        host.velocity[0] - relY / tangent * speed,
+        host.velocity[1] + relX / tangent * speed,
+        host.velocity[2]
+    ]);
+    body.reflectivity = 0.35;
+    body.texture = planetTexture(state.universe.length % 3);
+    addMass(body, state);
 }
 function syncCameraInputs() {
     const origin = scene.camera.origin;
@@ -1180,15 +1405,35 @@ function planetTexture(index) {
 }
 window.makeTexture = makeTexture;
 window.textureFromImage = textureFromImage;
-window.createSim = () => {
-    const sun = new Mass(1000000, [255, 210, 40, 255]);
-    sun.reflectivity = 0.45;
-    sun.texture = makeTexture(128, 128, (x, y) => {
+function sunTexture() {
+    return makeTexture(128, 128, (x, y) => {
         const grain = texNoise(x / 14, y / 14);
         const fine = texNoise(x / 5, y / 5);
         const hot = grain * 0.75 + fine * 0.25;
         return [150 + hot * 105, 40 + hot * 170, 10 + hot * 50, 255];
     });
+}
+function moonTexture() {
+    return makeTexture(128, 128, (x, y) => {
+        let shade = 168;
+        const craters = [[36, 40, 22], [88, 74, 16], [28, 96, 12], [78, 28, 10], [60, 60, 7]];
+        for (let i = 0; i < craters.length; i++) {
+            const dx = x - craters[i][0];
+            const dy = y - craters[i][1];
+            const d = Math.sqrt(dx * dx + dy * dy);
+            const r = craters[i][2];
+            if (d < r)
+                shade = 96;
+            else if (d < r + 3)
+                shade = 214;
+        }
+        return [shade, shade + 8, shade + 18, 255];
+    });
+}
+function systemBodies() {
+    const sun = new Mass(1000000, [255, 210, 40, 255]);
+    sun.reflectivity = 0.45;
+    sun.texture = sunTexture();
     const G = 6.67408e-7;
     const bodies = [sun];
     const orbits = [
@@ -1205,8 +1450,6 @@ window.createSim = () => {
         body.texture = planetTexture(i);
         bodies.push(body);
     }
-    // Moon of the outer planet. A uniform-density planet this close to the sun
-    // fills its own hill sphere, so the host is denser than it looks.
     const host = bodies[3];
     const hostRadius = host.size;
     const hostMass = 50000;
@@ -1220,27 +1463,59 @@ window.createSim = () => {
     const moonMass = (4 / 3) * Math.PI * moonRadius * moonRadius * moonRadius;
     const moonDist = 28;
     const moonSpeed = Math.sqrt(G * host.mass / moonDist);
-    bodies.push(new Mass(moonMass, [150, 230, 255, 255], [host.position[0] + moonDist, host.position[1], 0], [0, host.velocity[1] + moonSpeed, 0]));
-    bodies[bodies.length - 1].reflectivity = 0.6;
-    bodies[bodies.length - 1].texture = makeTexture(128, 128, (x, y) => {
-        let shade = 168;
-        const craters = [[36, 40, 22], [88, 74, 16], [28, 96, 12], [78, 28, 10], [60, 60, 7]];
-        for (let i = 0; i < craters.length; i++) {
-            const dx = x - craters[i][0];
-            const dy = y - craters[i][1];
-            const d = Math.sqrt(dx * dx + dy * dy);
-            const r = craters[i][2];
-            if (d < r)
-                shade = 96;
-            else if (d < r + 3)
-                shade = 214;
-        }
-        return [shade, shade + 8, shade + 18, 255];
+    const moon = new Mass(moonMass, [150, 230, 255, 255], [host.position[0] + moonDist, host.position[1], 0], [0, host.velocity[1] + moonSpeed, 0]);
+    moon.reflectivity = 0.6;
+    moon.texture = moonTexture();
+    bodies.push(moon);
+    return bodies;
+}
+function binaryBodies() {
+    const G = 6.67408e-7;
+    const mass = 400000;
+    const dist = 90;
+    const speed = Math.sqrt(G * (mass + mass) / dist) / 2;
+    const a = new Mass(mass, [255, 200, 80, 255], [-dist / 2, 0, 0], [0, speed, 0]);
+    const b = new Mass(mass, [140, 180, 255, 255], [dist / 2, 0, 0], [0, -speed, 0]);
+    a.reflectivity = 0.4;
+    b.reflectivity = 0.4;
+    a.texture = sunTexture();
+    b.texture = makeTexture(128, 128, (x, y) => {
+        const hot = texNoise(x / 12, y / 12);
+        return [40 + hot * 80, 80 + hot * 100, 180 + hot * 60, 255];
     });
-    const state = createUniverse(bodies);
-    // v is distance per sim-step and G is tiny, so 1 step/second barely crawls.
-    // 900 puts the inner orbit at about 8 seconds.
+    return [a, b];
+}
+function pairBodies() {
+    const G = 6.67408e-7;
+    const mass = 8000;
+    const dist = 150;
+    const speed = Math.sqrt(G * (mass + mass) / dist) / 2;
+    const a = new Mass(mass, [150, 170, 190, 255], [-dist / 2, 0, 0], [0, speed, 0]);
+    const b = new Mass(mass, [90, 110, 140, 255], [dist / 2, 0, 0], [0, -speed, 0]);
+    a.reflectivity = 0.2;
+    b.reflectivity = 0.25;
+    a.texture = planetTexture(2);
+    b.texture = planetTexture(1);
+    return [a, b];
+}
+function centerUniverse(state) {
+    const mass = state.currentCameraTarget;
+    if (!mass)
+        return;
+    const tp = mass.position.slice();
+    const universe = state.universe;
+    for (let i = 0; i < universe.length; i++) {
+        const p = universe[i].position;
+        p[0] -= tp[0];
+        p[1] -= tp[1];
+        p[2] -= tp[2];
+    }
+}
+window.createSim = (kind) => {
+    const builders = { system: systemBodies, binary: binaryBodies, pair: pairBodies };
+    const state = createUniverse((builders[kind] || systemBodies)());
     state.stepsPerSecond = 900;
+    centerUniverse(state);
     return state;
 };
 window.createRunner = (state, clock = new Clock(state), maxRunTime = 1000 / 30, GUIUpdateRate = 100) => {
@@ -1248,17 +1523,20 @@ window.createRunner = (state, clock = new Clock(state), maxRunTime = 1000 / 30, 
     let currentTick = 0, lastGUIUpdate = 0, currentTime;
     return playback ? runnerWithPlayback(playback) : runner;
     function runner(runTime = clock.currentTime) {
-        const t = clock.ticksTo(runTime);
+        const scale = viewParams.timeScale || 0;
+        if (!(scale > 0))
+            return;
+        const saved = state.ticksPerStep;
+        state.ticksPerStep = Math.max(2, Math.round(saved / Math.min(scale, 12)));
         const t0 = performance.now();
         let steps = 0;
-        while (currentTick < t && steps < 2000 && performance.now() - t0 < 8) {
+        while (steps < 100 && performance.now() - t0 < 10) {
             handleEvents(state);
             tick(state);
             currentTick++;
             steps++;
         }
-        if (currentTick < t)
-            clock.setNewStartTime(clock.currentTime, currentTick);
+        state.ticksPerStep = saved;
         centerOn(state.currentCameraTarget, state.universe);
     }
     function runnerWithPlayback(playback) {
@@ -1877,7 +2155,7 @@ export function boot(root) {
     }
     paintedCam = '';
     viewParams.running = true;
-    const button = el.querySelector('button');
+    const button = el.querySelector('button.pause');
     if (button)
         button.innerText = 'Pause';
     startLoop();

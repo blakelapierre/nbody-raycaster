@@ -16,24 +16,46 @@ root {
   color: #ddd;
   font: 13px/1.4 ui-monospace, monospace;
 }
-root canvas {
-  display: block;
+root .view-frame {
   position: sticky;
   top: 0;
   z-index: 1;
   width: min(100%, calc(58vh * 16 / 9));
+  margin: 0 auto;
+}
+root canvas.view {
+  display: block;
+  width: 100%;
   height: auto;
   max-height: 58vh;
-  margin: 0 auto;
   image-rendering: pixelated;
   background: #000;
 }
+root canvas.trails {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
 root state-view {
   display: block;
-  white-space: pre-wrap;
-  word-break: break-all;
-  overflow: auto;
-  max-height: 28vh;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0.25rem 0.4rem;
+}
+root .row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.35rem 0.4rem 0;
+}
+root .tag {
+  display: inline-block;
+  margin: 0 0.2rem;
+  opacity: 0.8;
 }
 root input, root button { margin: 0.15rem; }
-root input[type="range"] { max-width: min(280px, 70vw); }
+root input[type="range"] { max-width: min(220px, 46vw); }
