@@ -916,6 +916,22 @@ void main() {
             return false;
         }
     };
+    const waitUpTo = (ms) => {
+        if (!fence)
+            return true;
+        try {
+            const status = gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, Math.max(0, ms) * 1e6);
+            if (status === gl.TIMEOUT_EXPIRED || status === gl.WAIT_FAILED)
+                return false;
+            gl.deleteSync(fence);
+            fence = null;
+            return true;
+        }
+        catch (err) {
+            fence = null;
+            return true;
+        }
+    };
     const gpuMark = () => {
         try {
             if (fence)
@@ -927,6 +943,8 @@ void main() {
             fence = null;
         }
     };
+    let lastRayMs = 0;
+    const rayPixel = new Uint8Array(4);
     let traceW = 0;
     let traceH = 0;
     const traceTex = gl.createTexture();
@@ -962,6 +980,9 @@ void main() {
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         if (queried)
             endRayQuery(tw * th);
+        const readStart = performance.now();
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, rayPixel);
+        lastRayMs = Math.max(0.05, performance.now() - readStart);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.useProgram(blitProgram);
@@ -1009,8 +1030,10 @@ void main() {
         },
         paintFit,
         pending: gpuPending,
+        waitUpTo,
         mark: gpuMark,
         takeRayTiming,
+        rayMs: () => lastRayMs,
         rayTimingPending: () => !!rayQuery,
         hasRayTimer: () => !!timerExt,
         paintRandom(scene, count) {
@@ -1192,76 +1215,40 @@ const paintAdaptive = (scene) => {
     }
     if (!(adaptive.cap > 0))
         adaptive.cap = Math.min(nativePx, 140000);
-    const budgetMs = Math.min(28, Math.max(10, (adaptive.refresh || 33) * 0.85));
-    const sample = gpuPainter && gpuPainter.takeRayTiming && gpuPainter.takeRayTiming();
-    let spare = false;
-    if (sample) {
-        noteRayRate(sample.rays, sample.ms);
-        spare = sample.ms < budgetMs * 0.75;
-    }
-    else if (adaptive.submittedRays > 0) {
-        const dt = adaptive.frameDt || 0;
-        if (dt > 70) {
-            noteRayRate(adaptive.submittedRays, dt);
-            if (adaptive.good)
-                adaptive.ceiling = adaptive.good;
-            spare = false;
-        }
-        else {
-        const busy = !!(gpuPainter && gpuPainter.pending && gpuPainter.pending());
-        const elapsed = Math.max(0, performance.now() - (adaptive.submittedAt || performance.now()));
-        if (busy)
-            adaptive.pendingCount = (adaptive.pendingCount || 0) + 1;
-        else
-            adaptive.pendingCount = 0;
-        const fenceStuck = adaptive.pendingCount > 4;
-        if (!fenceStuck && busy) {
-            // The batch is still on the GPU, so this duration is a ceiling on the rate.
-            noteRayRate(adaptive.submittedRays, Math.max(elapsed, budgetMs));
-            spare = false;
-        }
-        else if (fenceStuck && dt > 70) {
-            noteRayRate(adaptive.submittedRays, dt);
-            spare = false;
-        }
-        else if (elapsed > 0.5) {
-            // It finished before we looked. rays/elapsed is only a lower bound, so step up and let the next overrun correct it.
-            const floor = adaptive.submittedRays / (elapsed / 1000);
-            if (!(adaptive.raysPerSec > floor))
-                adaptive.raysPerSec = floor;
-            spare = true;
-        }
-        }
-    }
-    let affordable = spare
-        ? Math.min(nativePx, Math.max(adaptive.cap * 2, (adaptive.raysPerSec || 0) * (budgetMs / 1000)))
-        : (adaptive.raysPerSec > 0
-            ? adaptive.raysPerSec * (budgetMs / 1000)
-            : adaptive.cap);
-    if (spare)
-        adaptive.good = adaptive.cap;
+    // One display frame. A faster measured refresh wins; never budget more than 60Hz.
+    const vsyncMs = Math.min(adaptive.refresh > 8 ? adaptive.refresh : 1000 / 60, 1000 / 60);
+    let affordable = adaptive.raysPerSec > 0
+        ? adaptive.raysPerSec * (vsyncMs / 1000)
+        : adaptive.cap;
     if (adaptive.ceiling > 0)
         affordable = Math.min(affordable, adaptive.ceiling);
     affordable = Math.max(16000, Math.min(nativePx, affordable));
-    if (adaptive.cap > 0)
-        affordable = Math.max(adaptive.cap * 0.5, Math.min(adaptive.cap * 2, affordable));
     adaptive.cap = affordable;
     const size = sizeForPixels(adaptive.cap, target);
     adaptive.cap = size.w * size.h;
     adaptive.traceW = size.w;
     adaptive.traceH = size.h;
     adaptive.level = Math.max(0, Math.round(Math.log2(nativePx / Math.max(1, adaptive.cap))));
+    const rayCount = size.w * size.h;
+    const traceStart = performance.now();
     if (gpuPainter && gpuPainter.paintFit)
         gpuPainter.paintFit(scene, size.w, size.h);
     else if (gpuPainter)
         gpuPainter.paint(scene);
     else if (context)
-        paintRandomCPU(scene, Math.min(adaptive.rays, size.w * size.h));
-    adaptive.submittedRays = size.w * size.h;
-    adaptive.submittedAt = performance.now();
+        paintRandomCPU(scene, Math.min(adaptive.rays, rayCount));
+    adaptive.submittedRays = rayCount;
+    adaptive.submittedAt = traceStart;
     if (gpuPainter && gpuPainter.mark)
         gpuPainter.mark();
-    adaptive.samples += size.w * size.h;
+    const timed = gpuPainter && gpuPainter.takeRayTiming && gpuPainter.takeRayTiming();
+    if (timed)
+        noteRayRate(timed.rays, timed.ms);
+    else if (gpuPainter && gpuPainter.rayMs)
+        noteRayRate(rayCount, gpuPainter.rayMs());
+    else if (adaptive.paintMs > 0)
+        noteRayRate(rayCount, adaptive.paintMs);
+    adaptive.samples += rayCount;
 };
 const tuneAdaptive = (paintMs) => {
     adaptive.paintMs = paintMs;
