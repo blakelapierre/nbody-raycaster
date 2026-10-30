@@ -873,6 +873,50 @@ void main() {
             fence = null;
         }
     };
+    let traceW = 0;
+    let traceH = 0;
+    const traceTex = gl.createTexture();
+    const traceFbo = gl.createFramebuffer();
+    gl.bindTexture(gl.TEXTURE_2D, traceTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const paintFit = (scene, tw, th) => {
+        tw = Math.max(2, tw);
+        th = Math.max(2, th);
+        if (traceW !== tw || traceH !== th) {
+            gl.bindTexture(gl.TEXTURE_2D, traceTex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, tw, th, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, traceFbo);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, traceTex, 0);
+            traceW = tw;
+            traceH = th;
+            if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                traceW = 0;
+                return false;
+            }
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, traceFbo);
+        upload(program, scene);
+        gl.viewport(0, 0, tw, th);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.useProgram(blitProgram);
+        gl.activeTexture(gl.TEXTURE4);
+        gl.bindTexture(gl.TEXTURE_2D, traceTex);
+        gl.uniform1i(blitSampler, 4);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        return true;
+    };
     return {
         gl,
         hold() {
@@ -906,6 +950,7 @@ void main() {
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             return true;
         },
+        paintFit,
         pending: gpuPending,
         mark: gpuMark,
         paintRandom(scene, count) {
@@ -1075,41 +1120,39 @@ const paintAdaptive = (scene) => {
     const target = nativeSize(canvas);
     const nativePx = Math.max(1, target.w * target.h);
     scene.camera.aspect = target.h > 0 ? target.w / target.h : 16 / 9;
+    if (Math.abs(canvas.width - target.w) > 24 || Math.abs(canvas.height - target.h) > 24) {
+        canvas.width = target.w;
+        canvas.height = target.h;
+    }
     if (!(adaptive.cap > 0))
-        adaptive.cap = Math.min(nativePx, 480 * 270);
-    const pending = !!(gpuPainter && gpuPainter.pending && gpuPainter.pending());
+        adaptive.cap = Math.min(nativePx, 140000);
     const dt = adaptive.frameDt || 0;
-    if (pending)
-        adaptive.pendingCount = (adaptive.pendingCount || 0) + 1;
-    else
-        adaptive.pendingCount = 0;
-    const backedUp = adaptive.pendingCount >= 2 || (adaptive.frames > 4 && dt > 50);
-    if (backedUp) {
-        adaptive.cap = Math.max(160 * 90, adaptive.cap * 0.7);
-        adaptive.ceiling = adaptive.cap;
-        adaptive.holdUntil = performance.now() + 1500;
+    const settled = adaptive.frames > 12;
+    if (settled && dt > 120) {
+        adaptive.ceiling = adaptive.good || Math.max(90000, adaptive.cap * 0.7);
+        adaptive.cap = adaptive.ceiling;
+        adaptive.holdUntil = performance.now() + 2000;
     }
-    else if (!pending && adaptive.frames > 6 && dt > 0 && dt < 40 && performance.now() > (adaptive.holdUntil || 0)) {
+    else if (settled && dt > 0 && dt < 42 && performance.now() > (adaptive.holdUntil || 0)) {
+        adaptive.good = adaptive.cap;
         const limit = Math.min(nativePx, adaptive.ceiling > 0 ? adaptive.ceiling : nativePx);
-        if (adaptive.cap < limit * 0.96)
-            adaptive.cap = Math.min(limit, Math.max(adaptive.cap * 1.12, adaptive.cap + 8000));
+        if (adaptive.cap < limit * 0.98 && performance.now() - (adaptive.lastGrow || 0) > 450) {
+            adaptive.cap = Math.min(limit, adaptive.cap * 1.1);
+            adaptive.lastGrow = performance.now();
+        }
     }
-    // A stuck fence used to skip every later paint. Never skip more than twice.
-    if (pending && adaptive.pendingCount < 3)
-        return;
     const size = sizeForPixels(adaptive.cap, target);
     adaptive.cap = size.w * size.h;
+    adaptive.traceW = size.w;
+    adaptive.traceH = size.h;
     adaptive.level = Math.max(0, Math.round(Math.log2(nativePx / Math.max(1, adaptive.cap))));
-    if (Math.abs(canvas.width - size.w) > 8 || Math.abs(canvas.height - size.h) > 8)
-        applySize(size.w, size.h, 'clear');
-    if (gpuPainter) {
+    if (gpuPainter && gpuPainter.paintFit)
+        gpuPainter.paintFit(scene, size.w, size.h);
+    else if (gpuPainter)
         gpuPainter.paint(scene);
-        if (gpuPainter.mark)
-            gpuPainter.mark();
-    }
     else if (context)
-        paintRandomCPU(scene, Math.min(adaptive.rays, canvas.width * canvas.height));
-    adaptive.samples += canvas.width * canvas.height;
+        paintRandomCPU(scene, Math.min(adaptive.rays, size.w * size.h));
+    adaptive.samples += size.w * size.h;
 };
 const tuneAdaptive = (paintMs) => {
     adaptive.paintMs = paintMs;
@@ -1165,8 +1208,10 @@ const animate = (stamp) => {
         const scale = viewParams.timeScale;
         const bodies = scene.simState.universe.length;
         const target = nativeSize(canvas);
-        const atWindow = Math.abs(canvas.width - target.w) <= 8 && Math.abs(canvas.height - target.h) <= 8;
-        stateView.innerText = canvas.width + '×' + canvas.height
+        const tw = adaptive.traceW || canvas.width;
+        const th = adaptive.traceH || canvas.height;
+        const atWindow = Math.abs(tw - target.w) <= 8 && Math.abs(th - target.h) <= 8;
+        stateView.innerText = tw + '×' + th
             + (atWindow ? '' : ' / ' + target.w + '×' + target.h)
             + '  ' + Math.round(adaptive.frameDt || adaptive.paintMs || 0) + 'ms  '
             + (scale > 0 ? scale + '×' : 'paused')
