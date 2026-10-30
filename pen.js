@@ -5,9 +5,25 @@ const canvasParams = {
     height: 540
 };
 const viewParams = {
-    pointsPerRender: 100,
+    pointsPerRender: 2000000,
     running: false
 };
+const resCap = { width: 3840, height: 2160 };
+const adaptive = {
+    rays: 4000,
+    level: 4,
+    samples: 0,
+    interval: 1000 / 60,
+    refresh: 1000 / 60,
+    lastStamp: 0,
+    key: '',
+    wantClimb: false,
+    forceDown: false,
+    blocked: -1,
+    slowLevel: -1,
+    frames: 0
+};
+const rayUVs = new Float32Array(200000 * 2);
 let wheelTimeout;
 const wheelTimeoutLength = 30;
 const setBinaryKeys = value => event => {
@@ -360,9 +376,9 @@ const attachView = el => {
     };
     const resizeBefore = gpuPainter ? undefined : saveCanvasData;
     const resizeAfter = gpuPainter ? undefined : restoreCanvasData;
-    const { input } = addPropertyControl(el, () => canvas, () => 'width', resizeBefore, resizeAfter, 1, 1920);
-    addPropertyControl(el, () => canvas, () => 'height', resizeBefore, resizeAfter, 1, 1920);
-    addPropertyControl(el, () => viewParams, () => 'pointsPerRender', undefined, undefined, 1, 10000);
+    const { input } = addPropertyControl(el, () => resCap, () => 'width', undefined, undefined, 1, 3840);
+    addPropertyControl(el, () => resCap, () => 'height', undefined, undefined, 1, 3840);
+    addPropertyControl(el, () => viewParams, () => 'pointsPerRender', undefined, undefined, 1, 2000000);
     addPropertyControl(el, () => scene.camera, () => 'fov');
     tagCam(addPropertyControl(el, () => scene.camera.origin, () => 0, undefined, undefined, -400, 400, 0.01), 0);
     tagCam(addPropertyControl(el, () => scene.camera.origin, () => 1, undefined, undefined, -400, 400, 0.01), 1);
@@ -457,7 +473,33 @@ function createGpuPainter(canvas) {
         return null;
     const vert = `#version 300 es
 in vec2 aPos;
-void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
+out vec2 vRay;
+void main() {
+  vec2 uv = aPos * 0.5 + 0.5;
+  vRay = vec2(uv.x, 1.0 - uv.y);
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+    const pointVert = `#version 300 es
+in vec2 aRay;
+out vec2 vRay;
+void main() {
+  vRay = aRay;
+  gl_Position = vec4(aRay.x * 2.0 - 1.0, (1.0 - aRay.y) * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}`;
+    const blitVert = `#version 300 es
+in vec2 aPos;
+out vec2 vUV;
+void main() {
+  vUV = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+    const blitFrag = `#version 300 es
+precision highp float;
+uniform sampler2D uHold;
+in vec2 vUV;
+out vec4 fragColor;
+void main() { fragColor = texture(uHold, vUV); }`;
     // Same rays as project(), same quadratic as sphereRayIntersection(), closest hit wins.
     const fragSrc = `#version 300 es
 precision highp float;
@@ -472,6 +514,7 @@ uniform sampler2D uSpheres;
 uniform sampler2D uColors;
 uniform sampler2D uTexRects;
 uniform sampler2D uAtlas;
+in vec2 vRay;
 out vec4 fragColor;
 vec3 rotateByQ(vec3 v, vec4 q) {
     float a = q.x;
@@ -492,8 +535,8 @@ vec3 albedo(vec3 n, int i) {
     return texture(uAtlas, uv).rgb;
 }
 void main() {
-    float uu = gl_FragCoord.x / uRes.x;
-    float vv = 1.0 - gl_FragCoord.y / uRes.y;
+    float uu = vRay.x;
+    float vv = vRay.y;
     float halfAngle = tan(uFov * 0.008726646259971648) * uPlane;
     vec3 rd = normalize(vec3((uu * 2.0 - 1.0) * uAspect * halfAngle, (1.0 - vv * 2.0) * halfAngle, uPlane));
     rd = rotateByQ(rd, uQ);
@@ -618,104 +661,341 @@ void main() {
     const boundTex = new Array(MAX_SPHERES);
     const boundRev = new Array(MAX_SPHERES).fill(0);
     let atlasDirty = false;
+    const pointVs = compile(gl.VERTEX_SHADER, pointVert);
+    if (!pointVs)
+        return null;
+    const pointProgram = gl.createProgram();
+    gl.attachShader(pointProgram, pointVs);
+    gl.attachShader(pointProgram, fs);
+    gl.bindAttribLocation(pointProgram, 0, 'aRay');
+    gl.linkProgram(pointProgram);
+    if (!pointVs || !gl.getProgramParameter(pointProgram, gl.LINK_STATUS)) {
+        console.error(gl.getProgramInfoLog(pointProgram));
+        return null;
+    }
+    const blitVs = compile(gl.VERTEX_SHADER, blitVert);
+    const blitFs = compile(gl.FRAGMENT_SHADER, blitFrag);
+    if (!blitVs || !blitFs)
+        return null;
+    const blitProgram = gl.createProgram();
+    gl.attachShader(blitProgram, blitVs);
+    gl.attachShader(blitProgram, blitFs);
+    gl.bindAttribLocation(blitProgram, 0, 'aPos');
+    gl.linkProgram(blitProgram);
+    if (!blitVs || !blitFs || !gl.getProgramParameter(blitProgram, gl.LINK_STATUS)) {
+        console.error(gl.getProgramInfoLog(blitProgram));
+        return null;
+    }
+    const ploc = name => gl.getUniformLocation(pointProgram, name);
+    const pOrigin = ploc('uOrigin');
+    const pQ = ploc('uQ');
+    const pFov = ploc('uFov');
+    const pAspect = ploc('uAspect');
+    const pPlane = ploc('uPlane');
+    const pRes = ploc('uRes');
+    const pCount = ploc('uCount');
+    const blitSampler = gl.getUniformLocation(blitProgram, 'uHold');
+    const rayBuffer = gl.createBuffer();
+    const holdTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, holdTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const upload = (prog, scene) => {
+        const objects = scene.objects;
+        const count = Math.min(objects.length, MAX_SPHERES);
+        for (let i = 0; i < count; i++) {
+            const sphere = objects[i][1];
+            const o = sphere.origin;
+            const color = sphere.color;
+            gpuSphereData[i * 4] = o[0];
+            gpuSphereData[i * 4 + 1] = o[1];
+            gpuSphereData[i * 4 + 2] = o[2];
+            gpuSphereData[i * 4 + 3] = sphere.radius;
+            gpuColorData[i * 4] = color[0];
+            gpuColorData[i * 4 + 1] = color[1];
+            gpuColorData[i * 4 + 2] = color[2];
+            gpuColorData[i * 4 + 3] = sphere.reflectivity || 0;
+            const tex = sphere.texture;
+            const col = i % ATLAS_TILES;
+            const row = (i / ATLAS_TILES) | 0;
+            gpuTexRectData[i * 4] = col / ATLAS_TILES;
+            gpuTexRectData[i * 4 + 1] = row / ATLAS_TILES;
+            gpuTexRectData[i * 4 + 2] = 1 / ATLAS_TILES;
+            gpuTexRectData[i * 4 + 3] = tex && tex.data ? 1 : 0;
+            const rev = tex ? tex.revision || 0 : 0;
+            if (boundTex[i] !== tex || boundRev[i] !== rev) {
+                if (tex && tex.data)
+                    blitTexture(i, tex);
+                boundTex[i] = tex;
+                boundRev[i] = rev;
+                atlasDirty = true;
+            }
+        }
+        for (let i = count; i < MAX_SPHERES; i++)
+            gpuTexRectData[i * 4 + 3] = 0;
+        const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
+        const originU = prog === pointProgram ? pOrigin : uOrigin;
+        const qU = prog === pointProgram ? pQ : uQ;
+        const fovU = prog === pointProgram ? pFov : uFov;
+        const aspectU = prog === pointProgram ? pAspect : uAspect;
+        const planeU = prog === pointProgram ? pPlane : uPlane;
+        const resU = prog === pointProgram ? pRes : uRes;
+        const countU = prog === pointProgram ? pCount : uCount;
+        gl.useProgram(prog);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, sphereTex);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuSphereData);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, colorTex);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuColorData);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, rectTex);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuTexRectData);
+        if (atlasDirty) {
+            gl.activeTexture(gl.TEXTURE3);
+            gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, ATLAS, ATLAS, gl.RGBA, gl.UNSIGNED_BYTE, gpuAtlasData);
+            atlasDirty = false;
+        }
+        gl.uniform1i(prog === pointProgram ? ploc('uSpheres') : loc('uSpheres'), 0);
+        gl.uniform1i(prog === pointProgram ? ploc('uColors') : loc('uColors'), 1);
+        gl.uniform1i(prog === pointProgram ? ploc('uTexRects') : loc('uTexRects'), 2);
+        gl.uniform1i(prog === pointProgram ? ploc('uAtlas') : loc('uAtlas'), 3);
+        gl.uniform3f(originU, scene.camera.origin[0], scene.camera.origin[1], scene.camera.origin[2]);
+        gl.uniform4f(qU, q[0], q[1], q[2], q[3]);
+        gl.uniform1f(fovU, scene.camera.fov);
+        gl.uniform1f(aspectU, scene.camera.aspect);
+        gl.uniform1f(planeU, scene.camera.planeDistance);
+        gl.uniform2f(resU, canvas.width, canvas.height);
+        gl.uniform1i(countU, count);
+        return count;
+    };
     return {
         gl,
+        hold() {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.bindTexture(gl.TEXTURE_2D, holdTex);
+            gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, canvas.width, canvas.height, 0);
+        },
+        drawHold(w, h) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, w, h);
+            gl.useProgram(blitProgram);
+            gl.activeTexture(gl.TEXTURE4);
+            gl.bindTexture(gl.TEXTURE_2D, holdTex);
+            gl.uniform1i(blitSampler, 4);
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+        },
+        clear(w, h) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, w, h);
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+        },
         paint(scene) {
-            const objects = scene.objects;
-            const count = Math.min(objects.length, MAX_SPHERES);
-            for (let i = 0; i < count; i++) {
-                const sphere = objects[i][1];
-                const o = sphere.origin;
-                const color = sphere.color;
-                gpuSphereData[i * 4] = o[0];
-                gpuSphereData[i * 4 + 1] = o[1];
-                gpuSphereData[i * 4 + 2] = o[2];
-                gpuSphereData[i * 4 + 3] = sphere.radius;
-                gpuColorData[i * 4] = color[0];
-                gpuColorData[i * 4 + 1] = color[1];
-                gpuColorData[i * 4 + 2] = color[2];
-                gpuColorData[i * 4 + 3] = sphere.reflectivity || 0;
-                const tex = sphere.texture;
-                const col = i % ATLAS_TILES;
-                const row = (i / ATLAS_TILES) | 0;
-                gpuTexRectData[i * 4] = col / ATLAS_TILES;
-                gpuTexRectData[i * 4 + 1] = row / ATLAS_TILES;
-                gpuTexRectData[i * 4 + 2] = 1 / ATLAS_TILES;
-                gpuTexRectData[i * 4 + 3] = tex && tex.data ? 1 : 0;
-                const rev = tex ? tex.revision || 0 : 0;
-                if (boundTex[i] !== tex || boundRev[i] !== rev) {
-                    if (tex && tex.data)
-                        blitTexture(i, tex);
-                    boundTex[i] = tex;
-                    boundRev[i] = rev;
-                    atlasDirty = true;
-                }
-            }
-            for (let i = count; i < MAX_SPHERES; i++)
-                gpuTexRectData[i * 4 + 3] = 0;
-            const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
-            gl.useProgram(program);
-            gl.viewport(0, 0, canvas.width, canvas.height);
-            gl.activeTexture(gl.TEXTURE0);
-            gl.bindTexture(gl.TEXTURE_2D, sphereTex);
-            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuSphereData);
-            gl.activeTexture(gl.TEXTURE1);
-            gl.bindTexture(gl.TEXTURE_2D, colorTex);
-            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuColorData);
-            gl.activeTexture(gl.TEXTURE2);
-            gl.bindTexture(gl.TEXTURE_2D, rectTex);
-            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuTexRectData);
-            if (atlasDirty) {
-                gl.activeTexture(gl.TEXTURE3);
-                gl.bindTexture(gl.TEXTURE_2D, atlasTex);
-                gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, ATLAS, ATLAS, gl.RGBA, gl.UNSIGNED_BYTE, gpuAtlasData);
-                atlasDirty = false;
-            }
-            gl.uniform3f(uOrigin, scene.camera.origin[0], scene.camera.origin[1], scene.camera.origin[2]);
-            gl.uniform4f(uQ, q[0], q[1], q[2], q[3]);
-            gl.uniform1f(uFov, scene.camera.fov);
-            gl.uniform1f(uAspect, scene.camera.aspect);
-            gl.uniform1f(uPlane, scene.camera.planeDistance);
-            gl.uniform2f(uRes, canvas.width, canvas.height);
-            gl.uniform1i(uCount, count);
+            upload(program, scene);
             gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
             gl.enableVertexAttribArray(0);
             gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             return true;
+        },
+        paintRandom(scene, count) {
+            const n = Math.max(0, Math.min(count, rayUVs.length / 2));
+            if (!n)
+                return 0;
+            upload(pointProgram, scene);
+            gl.bindBuffer(gl.ARRAY_BUFFER, rayBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, rayUVs.subarray(0, n * 2), gl.DYNAMIC_DRAW);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.POINTS, 0, n);
+            return n;
         }
     };
 }
-const paintFrame = (scene, context) => {
-    if (gpuPainter && gpuPainter.paint(scene))
-        return;
-    const w = context.canvas.width;
-    const h = context.canvas.height;
-    if (!frame || frame.width !== w || frame.height !== h)
-        frame = new ImageData(w, h);
-    const data = frame.data;
-    const miss = [0, 0, 0, 1];
-    let i = 0;
-    for (let y = 0; y < h; y++) {
-        const v = (y + 0.5) / h;
-        for (let x = 0; x < w; x++) {
-            const u = (x + 0.5) / w;
-            const color = cast(project(u, v, scene.camera), scene, miss);
-            data[i++] = color[0] * 255;
-            data[i++] = color[1] * 255;
-            data[i++] = color[2] * 255;
-            data[i++] = color[3] * 255;
-        }
+const sizeAt = (level, targetW, targetH) => {
+    const scale = 1 / (2 ** level);
+    let w = Math.max(2, Math.round(targetW * scale));
+    let h = Math.max(2, Math.round(targetH * scale));
+    if (w % 2)
+        w -= 1;
+    if (h % 2)
+        h -= 1;
+    return { w: Math.max(2, w), h: Math.max(2, h) };
+};
+const coverLevel = (target, rays) => {
+    const budget = Math.max(80, rays);
+    let level = 0;
+    while (level < 8) {
+        const size = sizeAt(level, target.w, target.h);
+        if (size.w * size.h <= budget)
+            return level;
+        level++;
     }
+    return 8;
+};
+const nativeSize = (canvasEl) => {
+    const rect = canvasEl.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    let w = Math.round(rect.width * dpr);
+    let h = Math.round(rect.height * dpr);
+    if (w < 2 || h < 2) {
+        w = canvasParams.width;
+        h = canvasParams.height;
+    }
+    w = Math.min(w, resCap.width || w);
+    h = Math.min(h, resCap.height || h);
+    return { w: Math.max(2, w), h: Math.max(2, h) };
+};
+const sceneSignature = (scene) => {
+    const cam = scene.camera;
+    const o = cam.origin;
+    const d = cam.dir;
+    let s = (o[0] | 0) + ',' + (o[1] | 0) + ',' + (o[2] | 0) + '/' + d[0].toFixed(2) + d[1].toFixed(2) + d[2].toFixed(2) + '/' + cam.fov;
+    const bodies = scene.simState.universe;
+    for (let i = 0; i < bodies.length; i++) {
+        const p = bodies[i].position;
+        s += '|' + (p[0] | 0) + ',' + (p[1] | 0) + ',' + (p[2] | 0);
+    }
+    return s;
+};
+const fillRandomUVs = (count, w, h) => {
+    const n = Math.max(0, Math.min(count | 0, rayUVs.length / 2));
+    const ux = 1 / Math.max(1, w);
+    const uy = 1 / Math.max(1, h);
+    for (let i = 0; i < n; i++) {
+        rayUVs[i * 2] = (Math.random() * (w - 1) + 0.5) * ux;
+        rayUVs[i * 2 + 1] = (Math.random() * (h - 1) + 0.5) * uy;
+    }
+    return n;
+};
+let scratch;
+const applySize = (w, h, mode) => {
+    if (mode === 'keep' && canvas.width === w && canvas.height === h)
+        return;
+    canvas.style.imageRendering = adaptive.level === 0 ? 'auto' : 'pixelated';
+    if (gpuPainter) {
+        const prevW = canvas.width;
+        const prevH = canvas.height;
+        if (mode === 'upscale' && prevW > 0 && prevH > 0)
+            gpuPainter.hold();
+        canvas.width = w;
+        canvas.height = h;
+        if (mode === 'upscale' && prevW > 0)
+            gpuPainter.drawHold(w, h);
+        else
+            gpuPainter.clear(w, h);
+        return;
+    }
+    if (!context)
+        return;
+    if (mode === 'upscale' && frame && frame.width > 0) {
+        if (!scratch)
+            scratch = document.createElement('canvas');
+        scratch.width = frame.width;
+        scratch.height = frame.height;
+        const scratchCtx = scratch.getContext('2d');
+        scratchCtx.putImageData(frame, 0, 0);
+        canvas.width = w;
+        canvas.height = h;
+        context.imageSmoothingEnabled = false;
+        context.drawImage(scratch, 0, 0, w, h);
+        frame = context.getImageData(0, 0, w, h);
+        return;
+    }
+    canvas.width = w;
+    canvas.height = h;
+    frame = context.createImageData(w, h);
     context.putImageData(frame, 0, 0);
 };
+const paintRandomCPU = (scene, count) => {
+    if (!frame || frame.width !== canvas.width || frame.height !== canvas.height)
+        frame = context.createImageData(canvas.width, canvas.height);
+    const w = frame.width;
+    const h = frame.height;
+    const data = frame.data;
+    const miss = [0, 0, 0, 1];
+    const limit = Math.max(4, adaptive.refresh * 0.75);
+    const t0 = performance.now();
+    let n = 0;
+    const cap = Math.min(count, rayUVs.length / 2);
+    for (; n < cap; n++) {
+        if ((n & 15) === 15 && performance.now() - t0 > limit)
+            break;
+        const u = Math.random();
+        const v = Math.random();
+        const color = cast(project(u, v, scene.camera), scene, miss);
+        const x = Math.min(w - 1, (u * w) | 0);
+        const y = Math.min(h - 1, (v * h) | 0);
+        const p = (y * w + x) * 4;
+        data[p] = color[0] * 255;
+        data[p + 1] = color[1] * 255;
+        data[p + 2] = color[2] * 255;
+        data[p + 3] = (color[3] * 255) | 0;
+    }
+    context.putImageData(frame, 0, 0);
+    return n;
+};
+const paintAdaptive = (scene) => {
+    const target = nativeSize(canvas);
+    scene.camera.aspect = target.w / target.h;
+    const covered = coverLevel(target, Math.min(adaptive.rays, viewParams.pointsPerRender));
+    if (covered < adaptive.level)
+        adaptive.level -= 1;
+    else if (covered > adaptive.level)
+        adaptive.level += 1;
+    adaptive.level = Math.max(0, Math.min(8, adaptive.level));
+    const key = target.w + 'x' + target.h + ':' + sceneSignature(scene);
+    const moved = key !== adaptive.key;
+    adaptive.key = key;
+    const size = sizeAt(adaptive.level, target.w, target.h);
+    const pixels = Math.max(1, size.w * size.h);
+    const want = Math.max(1, Math.round(Math.min(adaptive.rays, viewParams.pointsPerRender)));
+    const same = canvas.width === size.w && canvas.height === size.h;
+    if (!same)
+        applySize(size.w, size.h, 'clear');
+    else if (moved && want < pixels && gpuPainter)
+        gpuPainter.clear(canvas.width, canvas.height);
+    let castN = 0;
+    if (gpuPainter && (want >= pixels || !same)) {
+        gpuPainter.paint(scene);
+        castN = pixels;
+    }
+    else if (gpuPainter) {
+        const n = fillRandomUVs(want, canvas.width, canvas.height);
+        castN = gpuPainter.paintRandom(scene, n);
+    }
+    else if (context)
+        castN = paintRandomCPU(scene, want);
+    adaptive.samples += castN;
+};
+const tuneAdaptive = (paintMs) => {
+    adaptive.paintMs = paintMs;
+    adaptive.frames++;
+    const budget = Math.max(8, adaptive.refresh * 0.9);
+    const missed = adaptive.frames > 4 && (adaptive.frameDt || 0) > adaptive.refresh * 1.6;
+    const cap = Math.max(1, viewParams.pointsPerRender);
+    if (missed || paintMs > budget)
+        adaptive.rays = Math.max(800, adaptive.rays * 0.65);
+    else if (paintMs < budget * 0.75)
+        adaptive.rays = Math.min(cap, adaptive.rays * 1.3 + 200, adaptive.rays + 30000);
+};
+const paintFrame = (scene) => paintAdaptive(scene);
 let tps = 5;
 let lastTick = new Date().getTime();
 let currentTick = 0;
 let started = false;
 let paintedCam = '';
 let raf = 0;
-const animate = () => {
+const animate = (stamp) => {
+    const frameStart = performance.now();
     try {
         if (!started)
             start();
@@ -729,13 +1009,28 @@ const animate = () => {
             }
             scene.runner();
         }
-        syncSceneObjects(scene);
-        paintFrame(scene, context);
+    const paintStart = performance.now();
+    syncSceneObjects(scene);
+    paintAdaptive(scene);
+    const paintMs = performance.now() - paintStart;
+    const elapsed = performance.now() - frameStart;
+        if (stamp && adaptive.lastStamp) {
+            const dt = stamp - adaptive.lastStamp;
+            if (dt > 5 && dt < 80)
+                adaptive.refresh = adaptive.refresh * 0.85 + Math.min(dt, 34) * 0.15;
+            adaptive.frameDt = dt;
+        }
+        if (stamp)
+            adaptive.lastStamp = stamp;
+        tuneAdaptive(paintMs);
+        adaptive.elapsed = elapsed;
         if (viewParams.running)
             raf = requestAnimationFrame(animate);
         const universe = scene.simState.universe;
         stateView.innerText = JSON.stringify({
             cam: scene.camera.origin.map(v => Math.round(v)),
+            px: [canvas.width, canvas.height],
+            lvl: adaptive.level,
             bodies: universe.map(m => [Math.round(m.size), m.position.map(v => Math.round(v))])
         });
     }
