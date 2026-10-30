@@ -388,12 +388,7 @@ const attachView = el => {
     pauseButton.innerText = viewParams.running ? 'Pause' : 'Resume';
     pauseButton.addEventListener('click', () => {
         viewParams.running = !viewParams.running;
-        if (viewParams.running) {
-            pauseButton.innerText = 'Pause';
-            animate();
-        }
-        else
-            pauseButton.innerText = 'Resume';
+        pauseButton.innerText = viewParams.running ? 'Pause' : 'Resume';
     });
     el.append(pauseButton);
     const stateView = document.createElement('state-view');
@@ -1027,6 +1022,8 @@ let started = false;
 let paintedCam = '';
 let raf = 0;
 const animate = (stamp) => {
+    if (!viewParams.running)
+        return;
     const frameStart = performance.now();
     try {
         if (!started)
@@ -1041,11 +1038,11 @@ const animate = (stamp) => {
             }
             scene.runner();
         }
-    const paintStart = performance.now();
-    syncSceneObjects(scene);
-    paintAdaptive(scene);
-    const paintMs = performance.now() - paintStart;
-    const elapsed = performance.now() - frameStart;
+        const paintStart = performance.now();
+        syncSceneObjects(scene);
+        paintAdaptive(scene);
+        const paintMs = performance.now() - paintStart;
+        const elapsed = performance.now() - frameStart;
         if (stamp && adaptive.lastStamp) {
             const dt = stamp - adaptive.lastStamp;
             if (dt > 5 && dt < 80)
@@ -1056,8 +1053,6 @@ const animate = (stamp) => {
             adaptive.lastStamp = stamp;
         tuneAdaptive(paintMs);
         adaptive.elapsed = elapsed;
-        if (viewParams.running)
-            raf = requestAnimationFrame(animate);
         const universe = scene.simState.universe;
         stateView.innerText = JSON.stringify({
             cam: scene.camera.origin.map(v => Math.round(v)),
@@ -1067,11 +1062,17 @@ const animate = (stamp) => {
         });
     }
     catch (err) {
-        viewParams.running = false;
         if (stateView)
-            stateView.innerText = String(err && err.stack || err);
+            stateView.innerText = String(err && err.message || err);
     }
 };
+let pump = 0;
+function startLoop() {
+    clearInterval(pump);
+    cancelAnimationFrame(raf);
+    pump = setInterval(() => animate(performance.now()), 33);
+    animate(performance.now());
+}
 function start() {
     started = true;
     scene.simState = window.createSim();
@@ -1879,5 +1880,5 @@ export function boot(root) {
     const button = el.querySelector('button');
     if (button)
         button.innerText = 'Pause';
-    animate();
+    startLoop();
 }
