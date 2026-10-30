@@ -970,11 +970,23 @@ const sceneSignature = (scene) => {
 };
 const fillRandomUVs = (count, w, h) => {
     const n = Math.max(0, Math.min(count | 0, rayUVs.length / 2));
-    const ux = 1 / Math.max(1, w);
-    const uy = 1 / Math.max(1, h);
     for (let i = 0; i < n; i++) {
-        rayUVs[i * 2] = (Math.random() * (w - 1) + 0.5) * ux;
-        rayUVs[i * 2 + 1] = (Math.random() * (h - 1) + 0.5) * uy;
+        let u;
+        let v;
+        // Most rays land near the middle, where the bodies are, so that
+        // part of the window sharpens first. The rest cover the edges.
+        if ((i & 3) !== 0) {
+            u = 0.5 + (Math.random() + Math.random() + Math.random() - 1.5) * 0.28;
+            v = 0.5 + (Math.random() + Math.random() + Math.random() - 1.5) * 0.28;
+        }
+        else {
+            u = Math.random();
+            v = Math.random();
+        }
+        u = Math.min(0.999, Math.max(0, u));
+        v = Math.min(0.999, Math.max(0, v));
+        rayUVs[i * 2] = (Math.min(w - 1, u * w) + 0.5) / w;
+        rayUVs[i * 2 + 1] = (Math.min(h - 1, v * h) + 0.5) / h;
     }
     return n;
 };
@@ -1060,34 +1072,54 @@ const sizeForPixels = (pixels, target) => {
     return { w: Math.max(16, w), h: Math.max(16, h) };
 };
 const paintAdaptive = (scene) => {
-    const rect = canvas.getBoundingClientRect();
-    scene.camera.aspect = rect.width > 2 && rect.height > 2 ? rect.width / rect.height : 16 / 9;
-    // The window only scales this buffer. Resizing it to the window stalls the GPU.
-    const w = 480;
-    const h = 270;
-    adaptive.cap = w * h;
-    adaptive.level = 0;
-    if (canvas.width !== w || canvas.height !== h)
-        applySize(w, h, 'clear');
-    let castN = 0;
+    const target = nativeSize(canvas);
+    const nativePx = Math.max(1, target.w * target.h);
+    scene.camera.aspect = target.h > 0 ? target.w / target.h : 16 / 9;
+    if (!(adaptive.cap > 0))
+        adaptive.cap = Math.min(nativePx, 480 * 270);
+    const pending = !!(gpuPainter && gpuPainter.pending && gpuPainter.pending());
+    const dt = adaptive.frameDt || 0;
+    if (pending)
+        adaptive.pendingCount = (adaptive.pendingCount || 0) + 1;
+    else
+        adaptive.pendingCount = 0;
+    const backedUp = adaptive.pendingCount >= 2 || (adaptive.frames > 4 && dt > 50);
+    if (backedUp) {
+        adaptive.cap = Math.max(160 * 90, adaptive.cap * 0.7);
+        adaptive.ceiling = adaptive.cap;
+        adaptive.holdUntil = performance.now() + 1500;
+    }
+    else if (!pending && adaptive.frames > 6 && dt > 0 && dt < 40 && performance.now() > (adaptive.holdUntil || 0)) {
+        const limit = Math.min(nativePx, adaptive.ceiling > 0 ? adaptive.ceiling : nativePx);
+        if (adaptive.cap < limit * 0.96)
+            adaptive.cap = Math.min(limit, Math.max(adaptive.cap * 1.12, adaptive.cap + 8000));
+    }
+    // A stuck fence used to skip every later paint. Never skip more than twice.
+    if (pending && adaptive.pendingCount < 3)
+        return;
+    const size = sizeForPixels(adaptive.cap, target);
+    adaptive.cap = size.w * size.h;
+    adaptive.level = Math.max(0, Math.round(Math.log2(nativePx / Math.max(1, adaptive.cap))));
+    if (Math.abs(canvas.width - size.w) > 8 || Math.abs(canvas.height - size.h) > 8)
+        applySize(size.w, size.h, 'clear');
     if (gpuPainter) {
         gpuPainter.paint(scene);
-        castN = w * h;
+        if (gpuPainter.mark)
+            gpuPainter.mark();
     }
     else if (context)
-        castN = paintRandomCPU(scene, Math.min(adaptive.rays, w * h));
-    adaptive.samples += castN;
+        paintRandomCPU(scene, Math.min(adaptive.rays, canvas.width * canvas.height));
+    adaptive.samples += canvas.width * canvas.height;
 };
 const tuneAdaptive = (paintMs) => {
     adaptive.paintMs = paintMs;
     adaptive.frames++;
-    const budget = Math.max(8, adaptive.refresh * 0.9);
     const missed = adaptive.frames > 4 && (adaptive.frameDt || 0) > adaptive.refresh * 1.6;
-    const cap = Math.max(1, viewParams.pointsPerRender);
-    if (missed || paintMs > budget)
-        adaptive.rays = Math.max(800, adaptive.rays * 0.65);
-    else if (paintMs < budget * 0.75)
-        adaptive.rays = Math.min(cap, adaptive.rays * 1.3 + 200, adaptive.rays + 30000);
+    const cap = 14000;
+    if (missed || paintMs > 16)
+        adaptive.rays = Math.max(1200, adaptive.rays * 0.65);
+    else if (paintMs > 0 && paintMs < 8)
+        adaptive.rays = Math.min(cap, adaptive.rays * 1.12 + 400);
 };
 const paintFrame = (scene) => paintAdaptive(scene);
 let tps = 5;
@@ -1132,8 +1164,10 @@ const animate = (stamp) => {
         paintTrails();
         const scale = viewParams.timeScale;
         const bodies = scene.simState.universe.length;
+        const target = nativeSize(canvas);
+        const atWindow = Math.abs(canvas.width - target.w) <= 8 && Math.abs(canvas.height - target.h) <= 8;
         stateView.innerText = canvas.width + '×' + canvas.height
-            + '  lvl ' + adaptive.level
+            + (atWindow ? '' : ' / ' + target.w + '×' + target.h)
             + '  ' + Math.round(adaptive.frameDt || adaptive.paintMs || 0) + 'ms  '
             + (scale > 0 ? scale + '×' : 'paused')
             + '  ' + bodies;
