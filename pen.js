@@ -773,6 +773,34 @@ void main() {
         gl.uniform1i(countU, count);
         return count;
     };
+    let fence = null;
+    const gpuPending = () => {
+        if (!fence)
+            return false;
+        try {
+            const status = gl.clientWaitSync(fence, 0, 0);
+            if (status === gl.TIMEOUT_EXPIRED || status === gl.WAIT_FAILED)
+                return true;
+            gl.deleteSync(fence);
+            fence = null;
+            return false;
+        }
+        catch (err) {
+            fence = null;
+            return false;
+        }
+    };
+    const gpuMark = () => {
+        try {
+            if (fence)
+                gl.deleteSync(fence);
+            fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+            gl.flush();
+        }
+        catch (err) {
+            fence = null;
+        }
+    };
     return {
         gl,
         hold() {
@@ -806,6 +834,8 @@ void main() {
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             return true;
         },
+        pending: gpuPending,
+        mark: gpuMark,
         paintRandom(scene, count) {
             const n = Math.max(0, Math.min(count, rayUVs.length / 2));
             if (!n)
@@ -943,37 +973,39 @@ const paintRandomCPU = (scene, count) => {
     context.putImageData(frame, 0, 0);
     return n;
 };
+const sizeForPixels = (pixels, target) => {
+    const aspect = target.w / Math.max(1, target.h);
+    const maxPx = target.w * target.h;
+    const n = Math.max(16000, Math.min(maxPx, pixels));
+    let w = Math.sqrt(n * aspect);
+    let h = w / aspect;
+    w = Math.max(16, Math.min(target.w, Math.round(w)));
+    h = Math.max(16, Math.min(target.h, Math.round(h)));
+    if (w % 2)
+        w -= 1;
+    if (h % 2)
+        h -= 1;
+    return { w: Math.max(16, w), h: Math.max(16, h) };
+};
 const paintAdaptive = (scene) => {
     const target = nativeSize(canvas);
     scene.camera.aspect = target.w / target.h;
-    const covered = coverLevel(target, Math.min(adaptive.rays, viewParams.pointsPerRender));
-    if (covered < adaptive.level)
-        adaptive.level -= 1;
-    else if (covered > adaptive.level)
-        adaptive.level += 1;
-    adaptive.level = Math.max(0, Math.min(8, adaptive.level));
-    const key = target.w + 'x' + target.h + ':' + sceneSignature(scene);
-    const moved = key !== adaptive.key;
-    adaptive.key = key;
-    const size = sizeAt(adaptive.level, target.w, target.h);
-    const pixels = Math.max(1, size.w * size.h);
-    const want = Math.max(1, Math.round(Math.min(adaptive.rays, viewParams.pointsPerRender)));
-    const same = canvas.width === size.w && canvas.height === size.h;
-    if (!same)
-        applySize(size.w, size.h, 'clear');
-    else if (moved && want < pixels && gpuPainter)
-        gpuPainter.clear(canvas.width, canvas.height);
+    const nativePx = target.w * target.h;
+    // Stay on one size. Growing or skipping frames left the preview looking frozen.
+    if (!(adaptive.cap > 0))
+        adaptive.cap = Math.min(nativePx, 160000);
+    const size = sizeForPixels(adaptive.cap, target);
+    adaptive.cap = size.w * size.h;
+    adaptive.level = Math.max(0, Math.min(8, Math.round(Math.log2(nativePx / Math.max(1, adaptive.cap)))));
+    if (canvas.width !== size.w || canvas.height !== size.h)
+        applySize(size.w, size.h, 'upscale');
     let castN = 0;
-    if (gpuPainter && (want >= pixels || !same)) {
+    if (gpuPainter) {
         gpuPainter.paint(scene);
-        castN = pixels;
-    }
-    else if (gpuPainter) {
-        const n = fillRandomUVs(want, canvas.width, canvas.height);
-        castN = gpuPainter.paintRandom(scene, n);
+        castN = canvas.width * canvas.height;
     }
     else if (context)
-        castN = paintRandomCPU(scene, want);
+        castN = paintRandomCPU(scene, Math.min(adaptive.rays, canvas.width * canvas.height));
     adaptive.samples += castN;
 };
 const tuneAdaptive = (paintMs) => {
@@ -1216,11 +1248,16 @@ window.createRunner = (state, clock = new Clock(state), maxRunTime = 1000 / 30, 
     return playback ? runnerWithPlayback(playback) : runner;
     function runner(runTime = clock.currentTime) {
         const t = clock.ticksTo(runTime);
-        while (currentTick < t && ((currentTime = clock.currentTime) - runTime) < maxRunTime) {
+        const t0 = performance.now();
+        let steps = 0;
+        while (currentTick < t && steps < 2000 && performance.now() - t0 < 8) {
             handleEvents(state);
             tick(state);
             currentTick++;
+            steps++;
         }
+        if (currentTick < t)
+            clock.setNewStartTime(clock.currentTime, currentTick);
         centerOn(state.currentCameraTarget, state.universe);
     }
     function runnerWithPlayback(playback) {
@@ -1801,7 +1838,6 @@ export function boot(root) {
     const el = root || document.getElementsByTagName('root')[0];
     if (!el)
         return;
-    cancelAnimationFrame(raf);
     if (!wired) {
         wired = true;
         document.addEventListener('wheel', event => {
@@ -1824,6 +1860,7 @@ export function boot(root) {
     // is immediately replaced, so bind the view to whichever root is current.
     if (el.querySelector('canvas'))
         return;
+    cancelAnimationFrame(raf);
     const view = attachView(el);
     canvas = view.canvas;
     stateView = view.stateView;
