@@ -1063,26 +1063,13 @@ const paintAdaptive = (scene) => {
     const target = nativeSize(canvas);
     scene.camera.aspect = target.w / target.h;
     const nativePx = target.w * target.h;
+    // A larger frame blocks the preview for seconds. Stay small enough to finish.
     if (!(adaptive.cap > 0))
-        adaptive.cap = Math.min(nativePx, 140000);
-    const dt = adaptive.frameDt || 0;
-    const work = adaptive.paintMs || 0;
-    const late = adaptive.frames > 3 && (dt > 55 || work > 26);
-    const easy = adaptive.frames > 3 && work > 0 && work < 14 && dt > 0 && dt < 48;
-    if (late && performance.now() > (adaptive.holdUntil || 0)) {
-        adaptive.cap = Math.max(70000, adaptive.cap * 0.62);
-        adaptive.ceiling = adaptive.cap;
-        adaptive.holdUntil = performance.now() + 1200;
-    }
-    else if (easy && performance.now() > (adaptive.holdUntil || 0)) {
-        const limit = Math.min(nativePx, adaptive.ceiling || nativePx);
-        if (adaptive.cap < limit * 0.98)
-            adaptive.cap = Math.min(limit, adaptive.cap * 1.05);
-    }
+        adaptive.cap = Math.min(nativePx, 100000);
     const size = sizeForPixels(adaptive.cap, target);
     adaptive.cap = size.w * size.h;
     adaptive.level = Math.max(0, Math.min(8, Math.round(Math.log2(nativePx / Math.max(1, adaptive.cap)))));
-    if (canvas.width < 2 || Math.abs(canvas.width - size.w) / canvas.width > 0.18)
+    if (canvas.width !== size.w || canvas.height !== size.h)
         applySize(size.w, size.h, 'upscale');
     let castN = 0;
     if (gpuPainter) {
@@ -1290,6 +1277,13 @@ function paintTrails() {
         const c = mass.color;
         trailCtx.strokeStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.8)';
         trailCtx.stroke();
+        const here = worldToScreen(mass.position, scene.camera, w, h);
+        if (!here)
+            continue;
+        trailCtx.beginPath();
+        trailCtx.fillStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.95)';
+        trailCtx.arc(here[0], here[1], Math.max(2, mass.size * 0.15), 0, Math.PI * 2);
+        trailCtx.fill();
     }
 }
 function spawnFromClick(event) {
