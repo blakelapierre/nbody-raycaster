@@ -1928,22 +1928,26 @@ function pairBodies() {
     return [a, b];
 }
 function crowdBodies() {
-    const G = 6.67408e-7;
+    // Stronger than the solar-system constant so a mid-disk orbit takes a few
+    // seconds. The crowd only gets one or two steps a frame.
+    const G = 6.67408e-7 * 1.28e7;
     const sun = new Mass(2000000, [255, 214, 90, 255]);
     sun.reflectivity = 0.25;
     const bodies = [sun];
     const count = 1499;
-    const inner = sun.size + 10;
+    const inner = sun.size + 18;
     const outer = 560;
+    const radius = 4.5;
+    const particle = (4 / 3) * Math.PI * radius * radius * radius;
     const palette = [[176, 198, 255, 255], [255, 176, 114, 255], [226, 228, 236, 255]];
     for (let i = 0; i < count; i++) {
         const dist = inner + (outer - inner) * Math.sqrt((i + 0.5) / count);
         const ang = i * 2.399963229728653;
-        const lift = Math.sin(i * 12.9898) * dist * 0.08;
-        const radius = 4.5;
-        const mass = (4 / 3) * Math.PI * radius * radius * radius;
-        const speed = Math.sqrt(G * sun.mass / dist);
-        const body = new Mass(mass, palette[i % 3], [Math.cos(ang) * dist, Math.sin(ang) * dist, lift], [-Math.sin(ang) * speed, Math.cos(ang) * speed, 0]);
+        const lift = Math.sin(i * 12.9898) * dist * 0.05;
+        const enclosed = sun.mass + particle * count * ((i + 0.5) / count) * 0.55;
+        const speed = Math.sqrt(G * enclosed / dist) * (0.94 + (i % 5) * 0.025);
+        const climb = Math.cos(i * 4.37) * speed * 0.035;
+        const body = new Mass(particle, palette[i % 3], [Math.cos(ang) * dist, Math.sin(ang) * dist, lift], [-Math.sin(ang) * speed, Math.cos(ang) * speed, climb]);
         body.reflectivity = 0;
         bodies.push(body);
     }
@@ -1966,6 +1970,8 @@ window.createSim = (kind) => {
     const builders = { system: systemBodies, binary: binaryBodies, pair: pairBodies, crowd: crowdBodies };
     const state = createUniverse((builders[kind] || systemBodies)());
     state.stepsPerSecond = 900;
+    if (kind === 'crowd')
+        state.gravityConstant = 6.67408e-7 * 1.28e7;
     centerUniverse(state);
     return state;
 };
