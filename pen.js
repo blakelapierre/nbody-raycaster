@@ -2771,7 +2771,6 @@ function exactBodyForces(state) {
     const n = universe.length;
     const G = state.gravityConstant;
     const K = state.coulombConstant || 0;
-    const collisionList = state.collisionList;
     for (let i = 0; i < n; i++) {
         const a = universe[i];
         const pa = a.position;
@@ -2786,23 +2785,21 @@ function exactBodyForces(state) {
             const dy = pb[1] - pa[1];
             const dz = pb[2] - pa[2];
             const d2 = dx * dx + dy * dy + dz * dz;
-            if (!(d2 > 1e-8))
+            const gb = b.gravity;
+            const reach = sa + b.collisionSize;
+            if (!(d2 > 1e-8)) {
+                applySphereContact(pa, pb, a.velocity, b.velocity, sa, b.collisionSize, ma, b.mass, ga, gb, state.ticksPerStep);
                 continue;
+            }
             const inv = (G * ma * b.mass - K * qa * (b.charge || 0)) / (d2 * Math.sqrt(d2));
             ga[0] += dx * inv;
             ga[1] += dy * inv;
             ga[2] += dz * inv;
-            const gb = b.gravity;
             gb[0] -= dx * inv;
             gb[1] -= dy * inv;
             gb[2] -= dz * inv;
-            const reach = sa + b.collisionSize;
-            if (d2 < reach * reach) {
-                if (ma <= b.mass)
-                    collisionList.push([a, b, i, j]);
-                else
-                    collisionList.push([b, a, j, i]);
-            }
+            if (d2 < reach * reach)
+                applySphereContact(pa, pb, a.velocity, b.velocity, sa, b.collisionSize, ma, b.mass, ga, gb, state.ticksPerStep);
         }
         const invM = 1 / ma;
         ga[0] *= invM;
@@ -3228,48 +3225,389 @@ function shapeSupport(shape, n) {
     }
     return [shape.a[0], shape.a[1], shape.a[2]];
 }
-function bouncePair(v1, m1, v2, m2, n, restitution) {
-    const rel = (v1[0] - (v2 ? v2[0] : 0)) * n[0] + (v1[1] - (v2 ? v2[1] : 0)) * n[1] + (v1[2] - (v2 ? v2[2] : 0)) * n[2];
-    if (!(rel < 0))
+const CONTACT_RESTITUTION = 0.72;
+function contactForce(m1, m2, pen, vn, ticks) {
+    if (!(pen > 0) || !(m1 > 0) || !(ticks > 0))
+        return 0;
+    const mu = m2 > 0 ? (m1 * m2) / (m1 + m2) : m1;
+    if (!(mu > 0))
+        return 0;
+    let impulse = 0;
+    if (vn < 0)
+        impulse = -(1 + CONTACT_RESTITUTION) * vn * mu;
+    else {
+        const need = Math.min(0.75, pen * ticks / 40);
+        if (vn < need)
+            impulse = (need - vn) * mu;
+    }
+    return impulse * ticks;
+}
+function applyNormal(g, nx, ny, nz, scale) {
+    g[0] += nx * scale;
+    g[1] += ny * scale;
+    g[2] += nz * scale;
+}
+function applySphereContact(p1, p2, v1, v2, r1, r2, m1, m2, g1, g2, ticks) {
+    let dx = p1[0] - p2[0], dy = p1[1] - p2[1], dz = p1[2] - p2[2];
+    let dist = Math.hypot(dx, dy, dz);
+    const reach = r1 + r2;
+    if (!(dist < reach))
         return;
-    const inv = 1 / m1 + (m2 ? 1 / m2 : 0);
-    const j = -(1 + restitution) * rel / inv;
-    v1[0] += n[0] * j / m1;
-    v1[1] += n[1] * j / m1;
-    v1[2] += n[2] * j / m1;
-    if (v2 && m2) {
-        v2[0] -= n[0] * j / m2;
-        v2[1] -= n[1] * j / m2;
-        v2[2] -= n[2] * j / m2;
+    let nx, ny, nz;
+    if (!(dist > 1e-8)) {
+        nx = 0;
+        ny = 1;
+        nz = 0;
+        dist = 0;
+    } else {
+        nx = dx / dist;
+        ny = dy / dist;
+        nz = dz / dist;
+    }
+    const vn = (v1[0] - v2[0]) * nx + (v1[1] - v2[1]) * ny + (v1[2] - v2[2]) * nz;
+    const force = contactForce(m1, m2, reach - dist, vn, ticks);
+    if (!(force > 0))
+        return;
+    applyNormal(g1, nx, ny, nz, force);
+    applyNormal(g2, nx, ny, nz, -force);
+}
+function shapeSupportDir(shape, dx, dy, dz, out) {
+    const skin = 0.15;
+    if (shape.kind === 'box') {
+        const h = shape.b, c = shape.a;
+        out[0] = c[0] + (dx < 0 ? -h[0] : h[0]);
+        out[1] = c[1] + (dy < 0 ? -h[1] : h[1]);
+        out[2] = c[2] + (dz < 0 ? -h[2] : h[2]);
+        return;
+    }
+    if (shape.kind === 'disk') {
+        const len = Math.hypot(shape.b[0], shape.b[1], shape.b[2]) || 1;
+        const nx = shape.b[0] / len, ny = shape.b[1] / len, nz = shape.b[2] / len;
+        const axial = dx * nx + dy * ny + dz * nz;
+        const tx = dx - nx * axial, ty = dy - ny * axial, tz = dz - nz * axial;
+        const tl = Math.hypot(tx, ty, tz);
+        if (tl > 1e-8) {
+            const s = shape.r / tl;
+            out[0] = shape.a[0] + tx * s;
+            out[1] = shape.a[1] + ty * s;
+            out[2] = shape.a[2] + tz * s;
+        } else {
+            out[0] = shape.a[0];
+            out[1] = shape.a[1];
+            out[2] = shape.a[2];
+        }
+        const side = axial >= 0 ? skin : -skin;
+        out[0] += nx * side;
+        out[1] += ny * side;
+        out[2] += nz * side;
+        return;
+    }
+    if (shape.kind === 'capsule') {
+        const da = shape.a[0] * dx + shape.a[1] * dy + shape.a[2] * dz;
+        const db = shape.b[0] * dx + shape.b[1] * dy + shape.b[2] * dz;
+        const end = da > db ? shape.a : shape.b;
+        const len = Math.hypot(dx, dy, dz) || 1;
+        out[0] = end[0] + dx / len * shape.r;
+        out[1] = end[1] + dy / len * shape.r;
+        out[2] = end[2] + dz / len * shape.r;
+        return;
+    }
+    if (shape.kind === 'cylinder') {
+        const abx = shape.b[0] - shape.a[0], aby = shape.b[1] - shape.a[1], abz = shape.b[2] - shape.a[2];
+        const abLen = Math.hypot(abx, aby, abz) || 1;
+        const ax = abx / abLen, ay = aby / abLen, az = abz / abLen;
+        const da = shape.a[0] * dx + shape.a[1] * dy + shape.a[2] * dz;
+        const db = shape.b[0] * dx + shape.b[1] * dy + shape.b[2] * dz;
+        const end = da > db ? shape.a : shape.b;
+        const axial = dx * ax + dy * ay + dz * az;
+        const rx = dx - ax * axial, ry = dy - ay * axial, rz = dz - az * axial;
+        const rl = Math.hypot(rx, ry, rz);
+        out[0] = end[0];
+        out[1] = end[1];
+        out[2] = end[2];
+        if (rl > 1e-8) {
+            const s = shape.r / rl;
+            out[0] += rx * s;
+            out[1] += ry * s;
+            out[2] += rz * s;
+        }
+        return;
+    }
+    if (shape.kind === 'triangle') {
+        const pts = [shape.a, shape.b, shape.c];
+        let best = pts[0];
+        let bestD = best[0] * dx + best[1] * dy + best[2] * dz;
+        for (let i = 1; i < 3; i++) {
+            const d = pts[i][0] * dx + pts[i][1] * dy + pts[i][2] * dz;
+            if (d > bestD) {
+                best = pts[i];
+                bestD = d;
+            }
+        }
+        const e1x = shape.b[0] - shape.a[0], e1y = shape.b[1] - shape.a[1], e1z = shape.b[2] - shape.a[2];
+        const e2x = shape.c[0] - shape.a[0], e2y = shape.c[1] - shape.a[1], e2z = shape.c[2] - shape.a[2];
+        let nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+        const nl = Math.hypot(nx, ny, nz) || 1;
+        nx /= nl;
+        ny /= nl;
+        nz /= nl;
+        const side = (dx * nx + dy * ny + dz * nz) >= 0 ? skin : -skin;
+        out[0] = best[0] + nx * side;
+        out[1] = best[1] + ny * side;
+        out[2] = best[2] + nz * side;
+        return;
+    }
+    out[0] = shape.a[0];
+    out[1] = shape.a[1];
+    out[2] = shape.a[2];
+}
+function minkowskiSupport(a, b, dx, dy, dz) {
+    const pa = [0, 0, 0], pb = [0, 0, 0];
+    shapeSupportDir(a, dx, dy, dz, pa);
+    shapeSupportDir(b, -dx, -dy, -dz, pb);
+    return [pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]];
+}
+function contactCross(ax, ay, az, bx, by, bz) {
+    return [ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx];
+}
+function ensureSearchDir(dir, ax, ay, az) {
+    if (Math.hypot(dir[0], dir[1], dir[2]) > 1e-8)
+        return;
+    if (Math.abs(ax) < 0.9) {
+        dir[0] = 0;
+        dir[1] = -az;
+        dir[2] = ay;
+    } else {
+        dir[0] = -ay;
+        dir[1] = ax;
+        dir[2] = 0;
     }
 }
-function separatePair(body, shape, n, pen) {
-    const slop = 0.04;
-    const depth = pen - slop;
-    if (!(depth > 0))
-        return;
-    const fixed = shape.fixed || !(shape.mass > 0);
-    const share = fixed ? 1 : shape.mass / (body.mass + shape.mass);
-    body.position[0] += n[0] * depth * share;
-    body.position[1] += n[1] * depth * share;
-    body.position[2] += n[2] * depth * share;
-    if (!fixed)
-        translateShape(shape, [-n[0] * depth * (1 - share), -n[1] * depth * (1 - share), -n[2] * depth * (1 - share)]);
+function nextContactSimplex(simplex, dir) {
+    const n = simplex.length;
+    const a = simplex[n - 1];
+    const aox = -a[0], aoy = -a[1], aoz = -a[2];
+    if (n === 2) {
+        const b = simplex[0];
+        const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+        if (abx * aox + aby * aoy + abz * aoz > 0) {
+            const c = contactCross(abx, aby, abz, aox, aoy, aoz);
+            const d = contactCross(c[0], c[1], c[2], abx, aby, abz);
+            dir[0] = d[0];
+            dir[1] = d[1];
+            dir[2] = d[2];
+            ensureSearchDir(dir, abx, aby, abz);
+        } else {
+            simplex[0] = a;
+            simplex.length = 1;
+            dir[0] = aox;
+            dir[1] = aoy;
+            dir[2] = aoz;
+        }
+        return false;
+    }
+    if (n === 3) {
+        const b = simplex[1];
+        const c = simplex[0];
+        const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+        const acx = c[0] - a[0], acy = c[1] - a[1], acz = c[2] - a[2];
+        const abc = contactCross(abx, aby, abz, acx, acy, acz);
+        const acN = contactCross(abc[0], abc[1], abc[2], acx, acy, acz);
+        if (acN[0] * aox + acN[1] * aoy + acN[2] * aoz > 0) {
+            if (acx * aox + acy * aoy + acz * aoz > 0) {
+                simplex[0] = c;
+                simplex[1] = a;
+                simplex.length = 2;
+                const cr = contactCross(acx, acy, acz, aox, aoy, aoz);
+                const d = contactCross(cr[0], cr[1], cr[2], acx, acy, acz);
+                dir[0] = d[0];
+                dir[1] = d[1];
+                dir[2] = d[2];
+                ensureSearchDir(dir, acx, acy, acz);
+            } else {
+                simplex[0] = b;
+                simplex[1] = a;
+                simplex.length = 2;
+                return nextContactSimplex(simplex, dir);
+            }
+        } else {
+            const abN = contactCross(abx, aby, abz, abc[0], abc[1], abc[2]);
+            if (abN[0] * aox + abN[1] * aoy + abN[2] * aoz > 0) {
+                simplex[0] = b;
+                simplex[1] = a;
+                simplex.length = 2;
+                return nextContactSimplex(simplex, dir);
+            }
+            if (abc[0] * aox + abc[1] * aoy + abc[2] * aoz > 0) {
+                dir[0] = abc[0];
+                dir[1] = abc[1];
+                dir[2] = abc[2];
+            } else {
+                simplex[0] = b;
+                simplex[1] = c;
+                simplex[2] = a;
+                dir[0] = -abc[0];
+                dir[1] = -abc[1];
+                dir[2] = -abc[2];
+            }
+        }
+        return false;
+    }
+    const b = simplex[2];
+    const c = simplex[1];
+    const d = simplex[0];
+    const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+    const acx = c[0] - a[0], acy = c[1] - a[1], acz = c[2] - a[2];
+    const adx = d[0] - a[0], ady = d[1] - a[1], adz = d[2] - a[2];
+    const abc = contactCross(abx, aby, abz, acx, acy, acz);
+    const acd = contactCross(acx, acy, acz, adx, ady, adz);
+    const adb = contactCross(adx, ady, adz, abx, aby, abz);
+    if (abc[0] * aox + abc[1] * aoy + abc[2] * aoz > 0) {
+        simplex[0] = c;
+        simplex[1] = b;
+        simplex[2] = a;
+        simplex.length = 3;
+        dir[0] = abc[0];
+        dir[1] = abc[1];
+        dir[2] = abc[2];
+        return false;
+    }
+    if (acd[0] * aox + acd[1] * aoy + acd[2] * aoz > 0) {
+        simplex[0] = d;
+        simplex[1] = c;
+        simplex[2] = a;
+        simplex.length = 3;
+        dir[0] = acd[0];
+        dir[1] = acd[1];
+        dir[2] = acd[2];
+        return false;
+    }
+    if (adb[0] * aox + adb[1] * aoy + adb[2] * aoz > 0) {
+        simplex[0] = b;
+        simplex[1] = d;
+        simplex[2] = a;
+        simplex.length = 3;
+        dir[0] = adb[0];
+        dir[1] = adb[1];
+        dir[2] = adb[2];
+        return false;
+    }
+    return true;
 }
-function collideShapes(state) {
+function contactFace(verts, i, j, k) {
+    const a = verts[i], b = verts[j], c = verts[k];
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz);
+    if (!(len > 1e-10))
+        return null;
+    nx /= len;
+    ny /= len;
+    nz /= len;
+    let dist = nx * a[0] + ny * a[1] + nz * a[2];
+    if (dist < 0)
+        return { i, j: k, k: j, nx: -nx, ny: -ny, nz: -nz, dist: -dist };
+    return { i, j, k, nx, ny, nz, dist };
+}
+function addContactEdge(edges, a, b) {
+    for (let i = 0; i < edges.length; i++) {
+        if (edges[i][0] === b && edges[i][1] === a) {
+            edges.splice(i, 1);
+            return;
+        }
+    }
+    edges.push([a, b]);
+}
+function convexContact(a, b) {
+    const support = (dx, dy, dz) => minkowskiSupport(a, b, dx, dy, dz);
+    const dir = [1, 0, 0];
+    const simplex = [support(dir[0], dir[1], dir[2])];
+    dir[0] = -simplex[0][0];
+    dir[1] = -simplex[0][1];
+    dir[2] = -simplex[0][2];
+    let hit = false;
+    for (let iter = 0; iter < 32; iter++) {
+        if (!(Math.hypot(dir[0], dir[1], dir[2]) > 1e-12))
+            return null;
+        const p = support(dir[0], dir[1], dir[2]);
+        if (p[0] * dir[0] + p[1] * dir[1] + p[2] * dir[2] < 0)
+            return null;
+        simplex.push(p);
+        if (nextContactSimplex(simplex, dir)) {
+            hit = true;
+            break;
+        }
+    }
+    if (!hit || simplex.length < 4)
+        return null;
+    const verts = simplex.slice(0, 4);
+    let faces = [contactFace(verts, 0, 1, 2), contactFace(verts, 0, 2, 3), contactFace(verts, 0, 3, 1), contactFace(verts, 1, 3, 2)].filter(Boolean);
+    let best = null;
+    for (let iter = 0; iter < 24 && faces.length; iter++) {
+        let closest = faces[0];
+        for (let i = 1; i < faces.length; i++)
+            if (faces[i].dist < closest.dist)
+                closest = faces[i];
+        best = closest;
+        const p = support(closest.nx, closest.ny, closest.nz);
+        const proj = p[0] * closest.nx + p[1] * closest.ny + p[2] * closest.nz;
+        if (proj - closest.dist < 1e-4)
+            break;
+        verts.push(p);
+        const idx = verts.length - 1;
+        const edges = [];
+        const next = [];
+        for (let i = 0; i < faces.length; i++) {
+            const f = faces[i];
+            const dx = p[0] - verts[f.i][0], dy = p[1] - verts[f.i][1], dz = p[2] - verts[f.i][2];
+            if (dx * f.nx + dy * f.ny + dz * f.nz > 1e-6) {
+                addContactEdge(edges, f.i, f.j);
+                addContactEdge(edges, f.j, f.k);
+                addContactEdge(edges, f.k, f.i);
+            } else
+                next.push(f);
+        }
+        for (let i = 0; i < edges.length; i++) {
+            const f = contactFace(verts, edges[i][0], edges[i][1], idx);
+            if (f)
+                next.push(f);
+        }
+        faces = next;
+    }
+    if (!best || !(best.dist > 0))
+        return null;
+    return { n: [-best.nx, -best.ny, -best.nz], pen: best.dist };
+}
+function pushAccel(g, nx, ny, nz, force, mass) {
+    if (!g || !(mass > 0) || !(force !== 0))
+        return;
+    const s = force / mass;
+    g[0] += nx * s;
+    g[1] += ny * s;
+    g[2] += nz * s;
+}
+function shapeContacts(state) {
     const shapes = state.shapes;
     if (!shapes || !shapes.length)
         return;
+    const ticks = state.ticksPerStep;
     const universe = state.universe;
+    const zero = [0, 0, 0];
     for (let s = 0; s < shapes.length; s++) {
         const shape = shapes[s];
+        const shapeV = shape.fixed ? zero : shape.velocity;
+        const shapeM = shape.fixed ? 0 : shape.mass;
         for (let i = 0; i < universe.length; i++) {
             const body = universe[i];
             const hit = sphereShapeContact(body, shape);
             if (!hit)
                 continue;
-            separatePair(body, shape, hit.n, hit.pen);
-            bouncePair(body.velocity, body.mass, shape.fixed ? null : shape.velocity, shape.fixed ? 0 : shape.mass, hit.n, 0.35);
+            const vn = (body.velocity[0] - shapeV[0]) * hit.n[0] + (body.velocity[1] - shapeV[1]) * hit.n[1] + (body.velocity[2] - shapeV[2]) * hit.n[2];
+            const force = contactForce(body.mass, shapeM, hit.pen, vn, ticks);
+            pushAccel(body.gravity, hit.n[0], hit.n[1], hit.n[2], force, body.mass);
+            if (!shape.fixed)
+                pushAccel(shape.gravity, hit.n[0], hit.n[1], hit.n[2], -force, shape.mass);
         }
     }
     for (let s = 0; s < shapes.length; s++) {
@@ -3285,8 +3623,21 @@ function collideShapes(state) {
             const gap = (support[0] - plane.a[0]) * n[0] + (support[1] - plane.a[1]) * n[1] + (support[2] - plane.a[2]) * n[2];
             if (!(gap < 0))
                 continue;
-            translateShape(shape, [-n[0] * gap, -n[1] * gap, -n[2] * gap]);
-            bouncePair(shape.velocity, shape.mass, null, 0, n, 0.4);
+            const vn = shape.velocity[0] * n[0] + shape.velocity[1] * n[1] + shape.velocity[2] * n[2];
+            const force = contactForce(shape.mass, 0, -gap, vn, ticks);
+            pushAccel(shape.gravity, n[0], n[1], n[2], force, shape.mass);
+        }
+        for (let t = s + 1; t < shapes.length; t++) {
+            const other = shapes[t];
+            if (other.kind === 'plane' || other.fixed || !(other.mass > 0))
+                continue;
+            const hit = convexContact(shape, other);
+            if (!hit)
+                continue;
+            const vn = (shape.velocity[0] - other.velocity[0]) * hit.n[0] + (shape.velocity[1] - other.velocity[1]) * hit.n[1] + (shape.velocity[2] - other.velocity[2]) * hit.n[2];
+            const force = contactForce(shape.mass, other.mass, hit.pen, vn, ticks);
+            pushAccel(shape.gravity, hit.n[0], hit.n[1], hit.n[2], force, shape.mass);
+            pushAccel(other.gravity, hit.n[0], hit.n[1], hit.n[2], -force, other.mass);
         }
     }
 }
@@ -3296,7 +3647,6 @@ function tick(state) {
     updateGravities(state);
     updateVelocities(state);
     resolveCollisions(state);
-    collideShapes(state);
     function positionHalfTick({ universe, ticksPerStep, shapes }) {
         for (let i = 0; i < universe.length; i++) {
             const mass = universe[i];
@@ -3309,23 +3659,20 @@ function tick(state) {
         if (stateParts.universe.length >= GRAVITY_OCTREE_AT) {
             exactBodyForces(state);
             shapeForces(stateParts);
+            shapeContacts(stateParts);
             return;
         }
         const { universe, collisionList, ticksPerStep, gravityConstant, coulombConstant, speedlimit } = stateParts;
         for (let i = 0; i < universe.length; i++)
             updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, coulombConstant || 0, speedlimit);
         shapeForces(stateParts);
+        shapeContacts(stateParts);
     }
     function updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, coulombConstant, speedlimit) {
         const { position: p1, velocity: v1, acceleration: a1, gravity: g1, mass: m1, collisionSize: s1, collisions } = universe[i];
         const q1 = universe[i].charge || 0;
         for (let j = i + 1; j < universe.length; j++)
             updatePair(p1, v1, a1, g1, m1, s1, q1, i, j, collisions, collisionList, universe, ticksPerStep, gravityConstant, coulombConstant, speedlimit);
-        if (collisions.length > 0) {
-            for (let k = 0; k < collisions.length; k++)
-                collisionList.push(collisions[k]);
-            collisions.splice(0);
-        }
         // F = ma ... a = F/m
         div(g1, g1, m1);
     }
@@ -3335,7 +3682,7 @@ function tick(state) {
         sub(dd, p1, p2);
         const distance = magnitude(dd), t = -distance / (speedlimit * speedlimit), o = t / ticksPerStep;
         updatePositionAndGravity(o, a1, a2, v1, v2, p1, p2, g1, g2, m1 * m2 * gravityConstant - coulombConstant * q1 * q2);
-        handleCollision(s1, s2, m1, m2, distance, i, j, collisionList, collisions, universe);
+        applySphereContact(oldp1, oldp2, v1, v2, s1, s2, m1, m2, g1, g2, ticksPerStep);
     }
     function updatePositionAndGravity(o, a1, a2, v1, v2, p1, p2, g1, g2, gravityScalar) {
         updatePosition(oldp1, o, a1, v1, p1);
@@ -3360,17 +3707,6 @@ function tick(state) {
         if (d > 0)
             add(g, g, scale(dd, pv, gravityScalar / (d * Math.sqrt(d))));
     }
-    function handleCollision(s1, s2, m1, m2, distance, i, j, collisionList, collisions, universe) {
-        const threshold = s1 + s2;
-        if (distance < threshold) {
-            // Always queue on the outer body. Pushing onto j's list never
-            // flushed, because pairs are only visited with i < j.
-            if (m1 <= m2)
-                collisions.push([universe[i], universe[j], i, j]);
-            else
-                collisions.push([universe[j], universe[i], j, i]);
-        }
-    }
     function updateVelocities({ universe, ticksPerStep, shapes }) {
         universe.forEach(mass => updateMassVelocityAndPartialPosition(mass, ticksPerStep));
         shapeKick(shapes, ticksPerStep);
@@ -3380,63 +3716,7 @@ function tick(state) {
         mass.positionHalfTick(ticksPerStep);
     }
     function resolveCollisions(state) {
-        const { universe, positions, velocities, accelerations, gravities, masses, sizes, colors, events, collisionList, currentCameraTarget } = state;
-        const absorbed = new Set();
-        for (let i = 0; i < collisionList.length; i++) {
-            const [smallerMass, greaterMass] = collisionList[i];
-            if (!smallerMass || !greaterMass)
-                continue;
-            if (absorbed.has(smallerMass) || absorbed.has(greaterMass))
-                continue;
-            if (universe.indexOf(smallerMass) < 0 || universe.indexOf(greaterMass) < 0)
-                continue;
-            const m1 = greaterMass.mass;
-            const m2 = smallerMass.mass;
-            const total = m1 + m2;
-            if (!(total > 0))
-                continue;
-            const factor = m1 / total;
-            const ratio = m2 / total;
-            const mix = scale([0, 0, 0], smallerMass.color, ratio);
-            scale(greaterMass.color, greaterMass.color, factor);
-            add(greaterMass.color, greaterMass.color, mix);
-            scale(greaterMass.velocity, greaterMass.velocity, m1);
-            scale(dd, smallerMass.velocity, m2);
-            add(greaterMass.velocity, greaterMass.velocity, dd);
-            div(greaterMass.velocity, greaterMass.velocity, total);
-            greaterMass.mass = total;
-            greaterMass.charge = (greaterMass.charge || 0) + (smallerMass.charge || 0);
-            const gi = universe.indexOf(greaterMass);
-            if (gi >= 0) {
-                masses[gi] = greaterMass.mass;
-                sizes[gi] = greaterMass.size;
-            }
-            absorbed.add(smallerMass);
-        }
-        const removals = [];
-        absorbed.forEach(smallerMass => {
-            const smallerIndex = universe.indexOf(smallerMass);
-            if (smallerIndex >= 0)
-                removals.push([smallerMass, smallerIndex]);
-        });
-        removals.sort((a, b) => b[1] - a[1]);
-        for (let i = 0; i < removals.length; i++) {
-            const [smallerMass, smallerIndex] = removals[i];
-            const greaterMass = collisionList.find(pair => pair[0] === smallerMass)?.[1];
-            incrementStat(smallerMass.constructor.name, 'absorbedBy', greaterMass ? greaterMass.constructor.name : 'Mass');
-            events.push(['absorbed', smallerMass, greaterMass]);
-            universe.splice(smallerIndex, 1);
-            positions.splice(smallerIndex, 1);
-            velocities.splice(smallerIndex, 1);
-            accelerations.splice(smallerIndex, 1);
-            gravities.splice(smallerIndex, 1);
-            masses.splice(smallerIndex, 1);
-            sizes.splice(smallerIndex, 1);
-            colors.splice(smallerIndex, 1);
-            if (smallerMass === currentCameraTarget)
-                state.currentCameraTarget = getGreatestMass(state);
-        }
-        collisionList.splice(0);
+        state.collisionList.splice(0);
     }
 }
 function getGreatestMass(state) {
