@@ -443,7 +443,7 @@ const attachView = el => {
     canvas.addEventListener('click', event => spawnFromClick(event));
     const bar = document.createElement('div');
     bar.className = 'row';
-    const presets = [['system', 'System'], ['binary', 'Binary'], ['pair', 'Pair']];
+    const presets = [['system', 'System'], ['binary', 'Binary'], ['pair', 'Pair'], ['crowd', '1500']];
     for (let i = 0; i < presets.length; i++) {
         const button = document.createElement('button');
         button.innerText = presets[i][1];
@@ -1588,6 +1588,8 @@ function loadPreset(kind) {
         return;
     scene.simState = window.createSim(kind);
     adaptive.ceiling = 0;
+    adaptive.raysPerSec = 0;
+    adaptive.cap = 0;
     scene.runner = window.createRunner(scene.simState, new Clock(scene.simState), 1000 / 5, 1);
     frameCamera(scene);
     syncSceneObjects(scene);
@@ -1597,8 +1599,11 @@ function syncSceneObjects(scene) {
     if (!universe)
         return;
     const objects = [];
-    for (let i = 0; i < universe.length; i++) {
+    const crowd = universe.length > MAX_SPHERES;
+    for (let i = 0; i < universe.length && objects.length < MAX_SPHERES; i++) {
         const mass = universe[i];
+        if (crowd && i > 0 && mass.size < 4)
+            continue;
         const c = mass.color;
         objects.push(['sphere', {
             radius: mass.size,
@@ -1648,7 +1653,7 @@ function worldToScreen(point, camera, w, h) {
 }
 function sampleTrails() {
     const bodies = scene.simState && scene.simState.universe;
-    if (!bodies)
+    if (!bodies || bodies.length > MAX_SPHERES)
         return;
     for (let i = 0; i < bodies.length; i++) {
         const mass = bodies[i];
@@ -1676,6 +1681,35 @@ function paintTrails() {
     const bodies = scene.simState && scene.simState.universe;
     if (!bodies)
         return;
+    if (bodies.length > MAX_SPHERES) {
+        const buckets = [[], [], [], []];
+        const styles = [
+            'rgba(255,214,90,0.95)',
+            'rgba(176,198,255,0.9)',
+            'rgba(255,176,114,0.9)',
+            'rgba(226,228,236,0.88)'
+        ];
+        for (let i = 0; i < bodies.length; i++) {
+            const here = worldToScreen(bodies[i].position, scene.camera, w, h);
+            if (!here)
+                continue;
+            buckets[i === 0 ? 0 : (i % 3) + 1].push(here[0], here[1]);
+        }
+        for (let b = 0; b < buckets.length; b++) {
+            const pts = buckets[b];
+            if (!pts.length)
+                continue;
+            trailCtx.beginPath();
+            trailCtx.fillStyle = styles[b];
+            const rad = b === 0 ? 6 : 1.6;
+            for (let i = 0; i < pts.length; i += 2) {
+                trailCtx.moveTo(pts[i] + rad, pts[i + 1]);
+                trailCtx.arc(pts[i], pts[i + 1], rad, 0, Math.PI * 2);
+            }
+            trailCtx.fill();
+        }
+        return;
+    }
     trailCtx.lineWidth = 2;
     trailCtx.lineJoin = 'round';
     for (let i = 0; i < bodies.length; i++) {
@@ -1915,6 +1949,28 @@ function pairBodies() {
     b.texture = planetTexture(1);
     return [a, b];
 }
+function crowdBodies() {
+    const G = 6.67408e-7;
+    const sun = new Mass(2000000, [255, 214, 90, 255]);
+    sun.reflectivity = 0.25;
+    const bodies = [sun];
+    const count = 1499;
+    const inner = sun.size + 10;
+    const outer = 560;
+    const palette = [[176, 198, 255, 255], [255, 176, 114, 255], [226, 228, 236, 255]];
+    for (let i = 0; i < count; i++) {
+        const dist = inner + (outer - inner) * Math.sqrt((i + 0.5) / count);
+        const ang = i * 2.399963229728653;
+        const lift = Math.sin(i * 12.9898) * dist * 0.08;
+        const radius = 1.15;
+        const mass = (4 / 3) * Math.PI * radius * radius * radius;
+        const speed = Math.sqrt(G * sun.mass / dist);
+        const body = new Mass(mass, palette[i % 3], [Math.cos(ang) * dist, Math.sin(ang) * dist, lift], [-Math.sin(ang) * speed, Math.cos(ang) * speed, 0]);
+        body.reflectivity = 0;
+        bodies.push(body);
+    }
+    return bodies;
+}
 function centerUniverse(state) {
     const mass = state.currentCameraTarget;
     if (!mass)
@@ -1929,7 +1985,7 @@ function centerUniverse(state) {
     }
 }
 window.createSim = (kind) => {
-    const builders = { system: systemBodies, binary: binaryBodies, pair: pairBodies };
+    const builders = { system: systemBodies, binary: binaryBodies, pair: pairBodies, crowd: crowdBodies };
     const state = createUniverse((builders[kind] || systemBodies)());
     state.stepsPerSecond = 900;
     centerUniverse(state);
