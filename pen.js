@@ -563,7 +563,7 @@ function createGpuPainter(canvas) {
         antialias: false,
         depth: false,
         stencil: false,
-        preserveDrawingBuffer: true
+        preserveDrawingBuffer: false
     });
     if (!gl)
         return null;
@@ -1205,8 +1205,10 @@ void main() {
         if (queried)
             endRayQuery(tw * th);
         const readStart = performance.now();
-        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, rayPixel);
-        lastRayMs = Math.max(0.05, performance.now() - readStart);
+        // Mobile GPUs are tiled. A 1-pixel readPixels only waits for one
+        // tile, so the rate looks huge and the next frame fills the screen.
+        gl.finish();
+        lastRayMs = performance.now() - readStart;
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.useProgram(blitProgram);
@@ -1295,9 +1297,17 @@ const coverLevel = (target, rays) => {
     }
     return 8;
 };
+const touchDevice = () => {
+    const touch = (navigator.maxTouchPoints || 0) > 0;
+    if (!touch || typeof window.matchMedia !== 'function')
+        return false;
+    return window.matchMedia('(pointer: coarse)').matches;
+};
 const nativeSize = (canvasEl) => {
     const rect = canvasEl.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    // Phone pixels are already 2–3× the layout size. Tracing that buffer
+    // is what locks the tab. The picture still fills the window.
+    const dpr = touchDevice() ? 1 : Math.min(window.devicePixelRatio || 1, 3);
     let w = Math.round(rect.width * dpr);
     let h = Math.round(rect.height * dpr);
     if (w < 2 || h < 2) {
@@ -1413,7 +1423,7 @@ const paintRandomCPU = (scene, count) => {
 const sizeForPixels = (pixels, target) => {
     const aspect = target.w / Math.max(1, target.h);
     const maxPx = target.w * target.h;
-    const n = Math.max(16000, Math.min(maxPx, pixels));
+    const n = Math.max(800, Math.min(maxPx, pixels));
     let w = Math.sqrt(n * aspect);
     let h = w / aspect;
     w = Math.max(16, Math.min(target.w, Math.round(w)));
@@ -1425,7 +1435,8 @@ const sizeForPixels = (pixels, target) => {
     return { w: Math.max(16, w), h: Math.max(16, h) };
 };
 const noteRayRate = (rays, ms) => {
-    if (!(rays > 0) || !(ms > 0.05))
+    // Anything under a third of a millisecond didn't wait for the GPU.
+    if (!(rays > 0) || !(ms >= 0.35))
         return;
     const rate = rays / (ms / 1000);
     adaptive.raysPerSec = adaptive.raysPerSec ? adaptive.raysPerSec * 0.4 + rate * 0.6 : rate;
@@ -1438,8 +1449,9 @@ const paintAdaptive = (scene) => {
         canvas.width = target.w;
         canvas.height = target.h;
     }
+    const initial = touchDevice() ? 3600 : 16000;
     if (!(adaptive.cap > 0))
-        adaptive.cap = Math.min(nativePx, 140000);
+        adaptive.cap = Math.min(nativePx, initial);
     // One display frame. A faster measured refresh wins; never budget more than 60Hz.
     const vsyncMs = Math.min(adaptive.refresh > 8 ? adaptive.refresh : 1000 / 60, 1000 / 60);
     let affordable = adaptive.raysPerSec > 0
@@ -1447,7 +1459,8 @@ const paintAdaptive = (scene) => {
         : adaptive.cap;
     if (adaptive.ceiling > 0)
         affordable = Math.min(affordable, adaptive.ceiling);
-    affordable = Math.max(16000, Math.min(nativePx, affordable));
+    const minRays = adaptive.raysPerSec > 0 ? 800 : Math.min(nativePx, initial);
+    affordable = Math.max(minRays, Math.min(nativePx, affordable));
     adaptive.cap = affordable;
     const size = sizeForPixels(adaptive.cap, target);
     adaptive.cap = size.w * size.h;
@@ -1473,6 +1486,13 @@ const paintAdaptive = (scene) => {
         noteRayRate(rayCount, gpuPainter.rayMs());
     else if (adaptive.paintMs > 0)
         noteRayRate(rayCount, adaptive.paintMs);
+    const gpuMs = gpuPainter && gpuPainter.rayMs ? gpuPainter.rayMs() : 0;
+    if (gpuMs > vsyncMs * 1.3) {
+        adaptive.ceiling = Math.max(800, rayCount * (vsyncMs / gpuMs));
+    }
+    else if (gpuMs >= 0.35 && gpuMs < vsyncMs * 0.7 && adaptive.ceiling > 0 && rayCount >= adaptive.ceiling * 0.85) {
+        adaptive.ceiling = 0;
+    }
     adaptive.samples += rayCount;
 };
 const tuneAdaptive = (paintMs) => {

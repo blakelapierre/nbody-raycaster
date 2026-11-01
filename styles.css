@@ -2,6 +2,7 @@ html, body {
   margin: 0;
   height: 100%;
   background: #111;
+  touch-action: manipulation;
 }
 root {
   position: fixed;
@@ -15,12 +16,14 @@ root {
   background: #1a1a1a;
   color: #ddd;
   font: 13px/1.4 ui-monospace, monospace;
+  -webkit-overflow-scrolling: touch;
 }
 root .view-frame {
   position: sticky;
   top: 0;
   z-index: 1;
   width: min(100%, calc(72vh * 16 / 9));
+  width: min(100%, calc(72svh * 16 / 9));
   aspect-ratio: 16 / 9;
   margin: 0 auto;
 }
