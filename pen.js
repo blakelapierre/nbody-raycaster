@@ -183,6 +183,160 @@ const sphereRayIntersection = (sphere, ray) => {
         return;
     return vAdd(ray.origin, vScale(ray, t));
 };
+const shapeHit = (shape, ro, rd) => {
+    const kind = shape.kind;
+    if (kind === 'plane')
+        return rayPlane(ro, rd, shape.a, shape.b);
+    if (kind === 'disk')
+        return rayDisk(ro, rd, shape.a, shape.b, shape.r);
+    if (kind === 'box')
+        return rayBox(ro, rd, shape.a, shape.b);
+    if (kind === 'capsule')
+        return rayRound(ro, rd, shape.a, shape.b, shape.r, false);
+    if (kind === 'cylinder')
+        return rayRound(ro, rd, shape.a, shape.b, shape.r, true);
+    if (kind === 'triangle')
+        return rayTri(ro, rd, shape.a, shape.b, shape.c);
+};
+const rayPlane = (ro, rd, point, normal) => {
+    const denom = vDot(rd, normal);
+    if (Math.abs(denom) < 1e-6)
+        return;
+    const t = vDot(vDifference(ro, point), normal) / denom;
+    if (t < 0.02)
+        return;
+    return { t, at: vAdd(ro, vScale(rd, t)), n: denom > 0 ? vScale(normal, -1) : normal.slice() };
+};
+const rayDisk = (ro, rd, center, normal, radius) => {
+    const hit = rayPlane(ro, rd, center, normal);
+    if (!hit)
+        return;
+    const d = vDifference(center, hit.at);
+    if (vDot(d, d) > radius * radius)
+        return;
+    return hit;
+};
+const rayBox = (ro, rd, center, half) => {
+    let tmin = -1e30, tmax = 1e30, axis = 0, sign = 1;
+    for (let a = 0; a < 3; a++) {
+        if (Math.abs(rd[a]) < 1e-8) {
+            if (ro[a] < center[a] - half[a] || ro[a] > center[a] + half[a])
+                return;
+            continue;
+        }
+        const inv = 1 / rd[a];
+        let t1 = (center[a] - half[a] - ro[a]) * inv;
+        let t2 = (center[a] + half[a] - ro[a]) * inv;
+        let s1 = -1;
+        if (t1 > t2) {
+            const swap = t1;
+            t1 = t2;
+            t2 = swap;
+            s1 = 1;
+        }
+        if (t1 > tmin) {
+            tmin = t1;
+            axis = a;
+            sign = s1;
+        }
+        if (t2 < tmax)
+            tmax = t2;
+        if (tmax < tmin)
+            return;
+    }
+    const t = tmin > 0.02 ? tmin : tmax;
+    if (t < 0.02)
+        return;
+    const n = [0, 0, 0];
+    n[axis] = sign;
+    if (vDot(n, rd) > 0)
+        n[axis] = -n[axis];
+    return { t, at: vAdd(ro, vScale(rd, t)), n };
+};
+const rayRound = (ro, rd, pa, pb, ra, capped) => {
+    const ba = vDifference(pa, pb);
+    const oc = vDifference(pa, ro);
+    const baba = vDot(ba, ba);
+    const bard = vDot(ba, rd);
+    const baoc = vDot(ba, oc);
+    const k2 = baba - bard * bard;
+    const k1 = baba * vDot(oc, rd) - baoc * bard;
+    const k0 = baba * vDot(oc, oc) - baoc * baoc - ra * ra * baba;
+    let best;
+    const take = (t, n, at) => {
+        if (t >= 0.02 && (!best || t < best.t))
+            best = { t, at, n: vUnit(n) };
+    };
+    const h = k1 * k1 - k2 * k0;
+    if (h >= 0 && Math.abs(k2) > 1e-8) {
+        const s = Math.sqrt(h);
+        const ts = [(-k1 - s) / k2, (-k1 + s) / k2];
+        for (let i = 0; i < ts.length; i++) {
+            const t = ts[i];
+            const y = baoc + t * bard;
+            if (t < 0.02 || y <= 0 || y >= baba)
+                continue;
+            take(t, vDifference(vScale(ba, y / baba), vAdd(oc, vScale(rd, t))), vAdd(ro, vScale(rd, t)));
+        }
+    }
+    if (!capped) {
+        const ends = [pa, pb];
+        for (let i = 0; i < ends.length; i++) {
+            const hit = sphereAt(ro, rd, ends[i], ra);
+            if (hit)
+                take(hit.t, hit.n, hit.at);
+        }
+    }
+    else if (baba > 1e-8) {
+        const na = vUnit(ba);
+        const d0 = rayDisk(ro, rd, pa, vScale(na, -1), ra);
+        const d1 = rayDisk(ro, rd, pb, na, ra);
+        if (d0)
+            take(d0.t, d0.n, d0.at);
+        if (d1)
+            take(d1.t, d1.n, d1.at);
+    }
+    return best;
+};
+const sphereAt = (ro, rd, c, ra) => {
+    const oc = vDifference(ro, c);
+    const b = vDot(rd, oc);
+    const c0 = vDot(oc, oc) - ra * ra;
+    const h = b * b - c0;
+    if (h < 0)
+        return;
+    const s = Math.sqrt(h);
+    let t = b - s;
+    if (t < 0.02)
+        t = b + s;
+    if (t < 0.02)
+        return;
+    const at = vAdd(ro, vScale(rd, t));
+    return { t, at, n: vUnit(vDifference(c, at)) };
+};
+const rayTri = (ro, rd, a, b, c) => {
+    const e1 = vDifference(a, b), e2 = vDifference(a, c);
+    const pvec = vCrossProduct(rd, e2);
+    const det = vDot(e1, pvec);
+    if (Math.abs(det) < 1e-8)
+        return;
+    const inv = 1 / det;
+    const tvec = vDifference(a, ro);
+    const u = vDot(tvec, pvec) * inv;
+    if (u < 0 || u > 1)
+        return;
+    const qvec = vCrossProduct(tvec, e1);
+    const v = vDot(rd, qvec) * inv;
+    if (v < 0 || u + v > 1)
+        return;
+    const t = vDot(e2, qvec) * inv;
+    if (t < 0.02)
+        return;
+    let n = vUnit(vCrossProduct(e1, e2));
+    if (vDot(n, rd) > 0)
+        n = vScale(n, -1);
+    return { t, at: vAdd(ro, vScale(rd, t)), n };
+};
 const vRotateTo = (vector, direction) => {
     const q = qFromUnitVectors([0, 0, 1], vUnit(direction));
     return rotateVectorByQ(vector, q);
@@ -306,6 +460,22 @@ const traceRay = (dir, origin, scene, base, stepsLeft) => {
             bestT = t;
             bestSphere = object[1];
             bestPoint = intersection;
+        }
+    }
+    const shapes = scene.shapes;
+    if (shapes) {
+        for (let i = 0; i < shapes.length; i++) {
+            const hit = shapeHit(shapes[i], origin, dir);
+            if (!hit || hit.t < REFLECT_BIAS * 0.4 || hit.t >= bestT)
+                continue;
+            bestT = hit.t;
+            bestPoint = hit.at;
+            const shape = shapes[i];
+            bestSphere = {
+                origin: vAdd(hit.at, vScale(hit.n, -1)),
+                color: shape.color,
+                reflectivity: shape.reflectivity || 0
+            };
         }
     }
     if (!bestSphere)
@@ -443,7 +613,7 @@ const attachView = el => {
     canvas.addEventListener('click', event => spawnFromClick(event));
     const bar = document.createElement('div');
     bar.className = 'row';
-    const presets = [['system', 'System'], ['binary', 'Binary'], ['pair', 'Pair'], ['crowd', '1500']];
+    const presets = [['system', 'System'], ['binary', 'Binary'], ['pair', 'Pair'], ['crowd', '1500'], ['shapes', 'Shapes']];
     for (let i = 0; i < presets.length; i++) {
         const button = document.createElement('button');
         button.innerText = presets[i][1];
@@ -532,10 +702,12 @@ const paint = (data, context) => {
 let frame;
 const MAX_SPHERES = 64;
 const MAX_RENDER = 2048;
+const MAX_SHAPES = 8;
 const MAX_GPU_NODES = 2048;
 const gpuSphereData = new Float32Array(MAX_RENDER * 4);
 const gpuColorData = new Float32Array(MAX_RENDER * 4);
 const gpuTexRectData = new Float32Array(MAX_RENDER * 4);
+const gpuShapeData = new Float32Array(MAX_SHAPES * 16);
 const gpuNodeData = new Float32Array(MAX_GPU_NODES * 16);
 const gpuAtlasData = new Uint8Array(ATLAS * ATLAS * 4);
 const blitTexture = (tile, tex) => {
@@ -615,6 +787,9 @@ uniform sampler2D uSpheres;
 uniform sampler2D uColors;
 uniform sampler2D uTexRects;
 uniform sampler2D uAtlas;
+uniform sampler2D uShapes;
+uniform int uShapeCount;
+bool gShape = false;
 in vec2 vRay;
 out vec4 fragColor;
 vec3 rotateByQ(vec3 v, vec4 q) {
@@ -673,6 +848,7 @@ void considerSphere(int i, vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP,
     hitRef = texelFetch(uColors, ivec2(i, 0), 0).a;
     bestI = i;
     found = true;
+    gShape = false;
 }
 void walkSpheres(vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP, inout vec3 hitC, inout float hitRef, inout int bestI, inout bool found) {
     int stack[96];
@@ -769,6 +945,168 @@ bool treeBlocks(vec3 sro, vec3 ld, float lightT) {
     return false;
 }
 #endif
+void acceptShape(float t, vec3 at, vec3 n, vec3 rgb, float ref, inout float bestT, inout vec3 hitP, inout vec3 hitN, inout vec3 shapeRgb, inout float hitRef, inout bool found) {
+    if (t < 0.02 || t >= bestT)
+        return;
+    bestT = t;
+    hitP = at;
+    hitN = n;
+    shapeRgb = rgb;
+    hitRef = ref;
+    found = true;
+    gShape = true;
+}
+void considerShapes(vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP, inout vec3 hitN, inout vec3 shapeRgb, inout float hitRef, inout bool found) {
+    for (int i = 0; i < ${MAX_SHAPES}; i++) {
+        if (i >= uShapeCount)
+            return;
+        vec4 row0 = texelFetch(uShapes, ivec2(i, 0), 0);
+        vec4 row1 = texelFetch(uShapes, ivec2(i, 1), 0);
+        vec4 row2 = texelFetch(uShapes, ivec2(i, 2), 0);
+        vec4 row3 = texelFetch(uShapes, ivec2(i, 3), 0);
+        int kind = int(row1.w + 0.5);
+        vec3 rgb = row0.rgb;
+        float ref = row0.a;
+        vec3 a = row1.xyz;
+        vec3 b = row2.xyz;
+        vec3 c = row3.xyz;
+        float rad = row2.w;
+        if (kind == 1 || kind == 2) {
+            vec3 pn = normalize(b);
+            float denom = dot(rd, pn);
+            if (abs(denom) < 1.0e-6)
+                continue;
+            float t = dot(a - ro, pn) / denom;
+            if (t < 0.02)
+                continue;
+            vec3 at = ro + rd * t;
+            if (kind == 2 && dot(at - a, at - a) > rad * rad)
+                continue;
+            acceptShape(t, at, denom > 0.0 ? -pn : pn, rgb, ref, bestT, hitP, hitN, shapeRgb, hitRef, found);
+        } else if (kind == 3) {
+            vec3 inv = vec3(abs(rd.x) < 1.0e-8 ? 1.0e16 : 1.0 / rd.x, abs(rd.y) < 1.0e-8 ? 1.0e16 : 1.0 / rd.y, abs(rd.z) < 1.0e-8 ? 1.0e16 : 1.0 / rd.z);
+            vec3 t1 = (a - b - ro) * inv;
+            vec3 t2 = (a + b - ro) * inv;
+            vec3 tsm = min(t1, t2);
+            vec3 tsM = max(t1, t2);
+            float tmin = max(max(tsm.x, tsm.y), tsm.z);
+            float tmax = min(min(tsM.x, tsM.y), tsM.z);
+            if (tmax < tmin)
+                continue;
+            float t = tmin > 0.02 ? tmin : tmax;
+            if (t < 0.02)
+                continue;
+            vec3 p = (ro + rd * t) - a;
+            vec3 ap = abs(p) / max(b, vec3(1.0e-4));
+            vec3 n = vec3(0.0);
+            if (ap.x >= ap.y && ap.x >= ap.z)
+                n.x = p.x < 0.0 ? -1.0 : 1.0;
+            else if (ap.y >= ap.z)
+                n.y = p.y < 0.0 ? -1.0 : 1.0;
+            else
+                n.z = p.z < 0.0 ? -1.0 : 1.0;
+            if (dot(n, rd) > 0.0)
+                n = -n;
+            acceptShape(t, ro + rd * t, n, rgb, ref, bestT, hitP, hitN, shapeRgb, hitRef, found);
+        } else if (kind == 4 || kind == 5) {
+            vec3 ba = b - a;
+            vec3 oc = ro - a;
+            float baba = dot(ba, ba);
+            float bard = dot(ba, rd);
+            float baoc = dot(ba, oc);
+            float k2 = baba - bard * bard;
+            float k1 = baba * dot(oc, rd) - baoc * bard;
+            float k0 = baba * dot(oc, oc) - baoc * baoc - rad * rad * baba;
+            float h = k1 * k1 - k2 * k0;
+            if (h >= 0.0 && abs(k2) > 1.0e-6) {
+                float s = sqrt(h);
+                for (int side = 0; side < 2; side++) {
+                    float t = (-k1 + (side == 0 ? -s : s)) / k2;
+                    float y = baoc + t * bard;
+                    if (t < 0.02 || y <= 0.0 || y >= baba)
+                        continue;
+                    vec3 n = normalize(oc + rd * t - ba * y / baba);
+                    acceptShape(t, ro + rd * t, n, rgb, ref, bestT, hitP, hitN, shapeRgb, hitRef, found);
+                }
+            }
+            if (kind == 4) {
+                vec3 caps[2];
+                caps[0] = a;
+                caps[1] = b;
+                for (int cap = 0; cap < 2; cap++) {
+                    vec3 cc = caps[cap];
+                    vec3 soc = cc - ro;
+                    float sb = dot(rd, soc);
+                    float sc = dot(soc, soc) - rad * rad;
+                    float sd = sb * sb - sc;
+                    if (sd < 0.0)
+                        continue;
+                    float sroot = sqrt(sd);
+                    float t = sb - sroot;
+                    if (t < 0.02)
+                        t = sb + sroot;
+                    if (t < 0.02)
+                        continue;
+                    vec3 at = ro + rd * t;
+                    acceptShape(t, at, normalize(at - cc), rgb, ref, bestT, hitP, hitN, shapeRgb, hitRef, found);
+                }
+            } else if (baba > 1.0e-6) {
+                vec3 na = ba / sqrt(baba);
+                vec3 ends[2];
+                ends[0] = a;
+                ends[1] = b;
+                vec3 ns[2];
+                ns[0] = -na;
+                ns[1] = na;
+                for (int cap = 0; cap < 2; cap++) {
+                    float denom = dot(rd, ns[cap]);
+                    if (abs(denom) < 1.0e-6)
+                        continue;
+                    float t = dot(ends[cap] - ro, ns[cap]) / denom;
+                    if (t < 0.02)
+                        continue;
+                    vec3 at = ro + rd * t;
+                    if (dot(at - ends[cap], at - ends[cap]) > rad * rad)
+                        continue;
+                    acceptShape(t, at, denom > 0.0 ? -ns[cap] : ns[cap], rgb, ref, bestT, hitP, hitN, shapeRgb, hitRef, found);
+                }
+            }
+        } else if (kind == 6) {
+            vec3 e1 = b - a;
+            vec3 e2 = c - a;
+            vec3 pvec = cross(rd, e2);
+            float det = dot(e1, pvec);
+            if (abs(det) < 1.0e-6)
+                continue;
+            float invDet = 1.0 / det;
+            vec3 tvec = ro - a;
+            float u = dot(tvec, pvec) * invDet;
+            if (u < 0.0 || u > 1.0)
+                continue;
+            vec3 qvec = cross(tvec, e1);
+            float v = dot(rd, qvec) * invDet;
+            if (v < 0.0 || u + v > 1.0)
+                continue;
+            float t = dot(e2, qvec) * invDet;
+            vec3 n = normalize(cross(e1, e2));
+            if (dot(n, rd) > 0.0)
+                n = -n;
+            acceptShape(t, ro + rd * t, n, rgb, ref, bestT, hitP, hitN, shapeRgb, hitRef, found);
+        }
+    }
+}
+bool shapeBlocks(vec3 ro, vec3 rd, float limit) {
+    float bestT = limit;
+    vec3 hitP = ro;
+    vec3 hitN = ro;
+    vec3 shapeRgb = ro;
+    float hitRef = 0.0;
+    bool found = false;
+    bool saved = gShape;
+    considerShapes(ro, rd, bestT, hitP, hitN, shapeRgb, hitRef, found);
+    gShape = saved;
+    return found;
+}
 void main() {
     float uu = vRay.x;
     float vv = vRay.y;
@@ -787,9 +1125,13 @@ void main() {
         float bestT = 1.0e30;
         vec3 hitP = ro;
         vec3 hitC = ro;
+        vec3 hitN = vec3(0.0, 1.0, 0.0);
+        vec3 shapeRgb = vec3(0.0);
         float hitRef = 0.0;
         int bestI = 0;
         bool found = false;
+        gShape = false;
+        considerShapes(ro, rd, bestT, hitP, hitN, shapeRgb, hitRef, found);
 #if TREE
         walkSpheres(ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
 #else
@@ -820,13 +1162,14 @@ void main() {
             hitRef = texelFetch(uColors, ivec2(i, 0), 0).a;
             bestI = i;
             found = true;
+            gShape = false;
         }
 #endif
         if (!found)
             break;
-        vec3 nrm = normalize(hitP - hitC);
-        vec3 hitRgb = albedo(nrm, bestI);
-        if (bounce == 0 && bestI != 0 && uCount > 0) {
+        vec3 nrm = gShape ? hitN : normalize(hitP - hitC);
+        vec3 hitRgb = gShape ? shapeRgb : albedo(nrm, bestI);
+        if (bounce == 0 && uCount > 0 && (gShape || bestI != 0)) {
             vec4 sun = texelFetch(uSpheres, ivec2(0, 0), 0);
             vec3 toL = sun.xyz - hitP;
             float distL = length(toL);
@@ -859,6 +1202,8 @@ void main() {
                 }
             }
 #endif
+            if (shapeBlocks(sro, ld, lightT))
+                shade = min(shade, 0.28);
             hitRgb *= shade;
         }
         float mirror = bounce + 1 == BOUNCES ? 0.0 : clamp(hitRef, 0.0, 1.0);
@@ -866,9 +1211,8 @@ void main() {
         thru *= mirror;
         if (thru <= 0.0)
             break;
-        vec3 n = normalize(hitP - hitC);
-        rd = normalize(reflect(rd, n));
-        ro = hitP + n * 0.05;
+        rd = normalize(reflect(rd, nrm));
+        ro = hitP + nrm * 0.05;
     }
     fragColor = vec4(accum, 1.0);
 }`;
@@ -945,6 +1289,14 @@ void main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 4, MAX_GPU_NODES, 0, gl.RGBA, gl.FLOAT, null);
+    const shapeTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, shapeTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_SHAPES, 4, 0, gl.RGBA, gl.FLOAT, null);
     const loc = name => gl.getUniformLocation(program, name);
     const uOrigin = loc('uOrigin');
     const uQ = loc('uQ');
@@ -958,6 +1310,7 @@ void main() {
     gl.uniform1i(loc('uColors'), 1);
     gl.uniform1i(loc('uTexRects'), 2);
     gl.uniform1i(loc('uAtlas'), 3);
+    gl.uniform1i(loc('uShapes'), 4);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     const boundTex = new Array(MAX_RENDER);
@@ -1004,6 +1357,28 @@ void main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const SHAPE_KIND = { plane: 1, disk: 2, box: 3, capsule: 4, cylinder: 5, triangle: 6 };
+    const packShapes = (shapes) => {
+        gpuShapeData.fill(0);
+        const n = Math.min(shapes.length, MAX_SHAPES);
+        for (let i = 0; i < n; i++) {
+            const s = shapes[i];
+            const put = (row, x, y, z, w) => {
+                const o = (row * MAX_SHAPES + i) * 4;
+                gpuShapeData[o] = x;
+                gpuShapeData[o + 1] = y;
+                gpuShapeData[o + 2] = z;
+                gpuShapeData[o + 3] = w;
+            };
+            const color = s.color;
+            put(0, color[0], color[1], color[2], s.reflectivity || 0);
+            put(1, s.a[0], s.a[1], s.a[2], SHAPE_KIND[s.kind] || 0);
+            put(2, s.b[0], s.b[1], s.b[2], s.r || 0);
+            const c = s.c || [0, 0, 0];
+            put(3, c[0], c[1], c[2], 0);
+        }
+        return n;
+    };
     const upload = (prog, scene) => {
         const objects = scene.objects;
         const count = Math.min(objects.length, MAX_RENDER);
@@ -1037,6 +1412,7 @@ void main() {
         }
         for (let i = count; i < MAX_RENDER; i++)
             gpuTexRectData[i * 4 + 3] = 0;
+        const shapeCount = packShapes(scene.shapes || []);
         const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
         const treeOn = count > MAX_SPHERES && !!(treeProgram && packGpuNodes(count));
         const active = prog === pointProgram ? pointProgram : (treeOn ? treeProgram : program);
@@ -1063,6 +1439,11 @@ void main() {
         gl.uniform1i(U('uColors'), 1);
         gl.uniform1i(U('uTexRects'), 2);
         gl.uniform1i(U('uAtlas'), 3);
+        gl.activeTexture(gl.TEXTURE4);
+        gl.bindTexture(gl.TEXTURE_2D, shapeTex);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SHAPES, 4, gl.RGBA, gl.FLOAT, gpuShapeData);
+        gl.uniform1i(U('uShapes'), 4);
+        gl.uniform1i(U('uShapeCount'), shapeCount);
         gl.uniform3f(U('uOrigin'), scene.camera.origin[0], scene.camera.origin[1], scene.camera.origin[2]);
         gl.uniform4f(U('uQ'), q[0], q[1], q[2], q[3]);
         gl.uniform1f(U('uFov'), scene.camera.fov);
@@ -1621,6 +2002,7 @@ function syncSceneObjects(scene) {
         }]);
     }
     scene.objects = objects;
+    scene.shapes = (scene.simState && scene.simState.shapes) || [];
 }
 function frameCamera(scene) {
     const universe = scene.simState.universe;
@@ -1634,6 +2016,33 @@ function frameCamera(scene) {
         maxX = Math.max(maxX, mass.position[0] + mass.size);
         minY = Math.min(minY, mass.position[1] - mass.size);
         maxY = Math.max(maxY, mass.position[1] + mass.size);
+    }
+    const shapes = scene.simState.shapes || [];
+    for (let i = 0; i < shapes.length; i++) {
+        const shape = shapes[i];
+        const pad = shape.r || 0;
+        const pts = [shape.a, shape.b, shape.c];
+        for (let k = 0; k < pts.length; k++) {
+            const p = pts[k];
+            if (!p)
+                continue;
+            if (shape.kind === 'plane' && k > 0)
+                continue;
+            if (shape.kind === 'disk' && k > 0)
+                continue;
+            if (shape.kind === 'box' && k > 0)
+                continue;
+            minX = Math.min(minX, p[0] - pad);
+            maxX = Math.max(maxX, p[0] + pad);
+            minY = Math.min(minY, p[1] - pad);
+            maxY = Math.max(maxY, p[1] + pad);
+        }
+        if (shape.kind === 'box') {
+            minX = Math.min(minX, shape.a[0] - shape.b[0]);
+            maxX = Math.max(maxX, shape.a[0] + shape.b[0]);
+            minY = Math.min(minY, shape.a[1] - shape.b[1]);
+            maxY = Math.max(maxY, shape.a[1] + shape.b[1]);
+        }
     }
     const midX = (minX + maxX) / 2;
     const midY = (minY + maxY) / 2;
@@ -1953,6 +2362,47 @@ function crowdBodies() {
     }
     return bodies;
 }
+function shapeBodies() {
+    const G = 6.67408e-7;
+    const K = 40000;
+    const core = new Mass(20000, [90, 150, 255, 255]);
+    core.charge = -4;
+    core.reflectivity = 0.35;
+    const bodies = [core];
+    const moons = [
+        [70, 1, 0.4, [255, 96, 64, 255]],
+        [70, 1, 2.6, [255, 176, 64, 255]],
+        [108, -1, 4.4, [150, 230, 255, 255]]
+    ];
+    for (let i = 0; i < moons.length; i++) {
+        const dist = moons[i][0], q = moons[i][1], ang = moons[i][2], color = moons[i][3];
+        const mass = 4000;
+        const toward = (G * core.mass - K * q * core.charge / mass) / (dist * dist);
+        const speed = Math.sqrt(Math.max(0, toward) * dist);
+        const body = new Mass(mass, color, [Math.cos(ang) * dist, Math.sin(ang) * dist, 0], [-Math.sin(ang) * speed, Math.cos(ang) * speed, 0]);
+        body.charge = q;
+        body.reflectivity = 0.4;
+        bodies.push(body);
+    }
+    const left = new Mass(3000, [255, 70, 110, 255], [-28, 52, 0], [0, 0.12, 0]);
+    const right = new Mass(3000, [255, 70, 110, 255], [28, 52, 0], [0, 0.12, 0]);
+    left.charge = 2;
+    right.charge = 2;
+    left.reflectivity = 0.25;
+    right.reflectivity = 0.25;
+    bodies.push(left, right);
+    return bodies;
+}
+function shapePrimitives() {
+    return [
+        { kind: 'plane', a: [0, -90, 0], b: [0, 1, 0], color: [0.16, 0.18, 0.22, 1], reflectivity: 0.08 },
+        { kind: 'disk', a: [-90, 0, 36], b: [0, 0, 1], r: 22, color: [0.95, 0.5, 0.15, 1], reflectivity: 0.2 },
+        { kind: 'box', a: [-20, 8, 48], b: [16, 16, 16], color: [0.3, 0.78, 0.38, 1], reflectivity: 0.15 },
+        { kind: 'capsule', a: [40, -28, 36], b: [40, 32, 36], r: 10, color: [0.3, 0.85, 0.92, 1], reflectivity: 0.2 },
+        { kind: 'cylinder', a: [100, -32, 28], b: [100, 36, 28], r: 12, color: [0.58, 0.36, 0.92, 1], reflectivity: 0.15 },
+        { kind: 'triangle', a: [20, 55, 20], b: [78, 70, 8], c: [36, 28, 52], color: [0.9, 0.9, 0.84, 1], reflectivity: 0.5 }
+    ];
+}
 function centerUniverse(state) {
     const mass = state.currentCameraTarget;
     if (!mass)
@@ -1967,9 +2417,11 @@ function centerUniverse(state) {
     }
 }
 window.createSim = (kind) => {
-    const builders = { system: systemBodies, binary: binaryBodies, pair: pairBodies, crowd: crowdBodies };
+    const builders = { system: systemBodies, binary: binaryBodies, pair: pairBodies, crowd: crowdBodies, shapes: shapeBodies };
     const state = createUniverse((builders[kind] || systemBodies)());
     state.stepsPerSecond = 900;
+    state.coulombConstant = kind === 'shapes' ? 40000 : 0;
+    state.shapes = kind === 'shapes' ? shapePrimitives() : [];
     if (kind === 'crowd')
         state.gravityConstant = 6.67408e-7 * 1.28e7;
     centerUniverse(state);
@@ -1994,7 +2446,9 @@ window.createRunner = (state, clock = new Clock(state), maxRunTime = 1000 / 30, 
             steps++;
         }
         state.ticksPerStep = saved;
+        const shift = state.currentCameraTarget && state.currentCameraTarget.position.slice();
         centerOn(state.currentCameraTarget, state.universe);
+        shiftShapes(state.shapes, shift);
     }
     function runnerWithPlayback(playback) {
         let event = playback.shift();
@@ -2009,7 +2463,9 @@ window.createRunner = (state, clock = new Clock(state), maxRunTime = 1000 / 30, 
                 tick(state);
                 currentTick++;
             }
+            const shift = state.currentCameraTarget && state.currentCameraTarget.position.slice();
             centerOn(state.currentCameraTarget, state.universe);
+            shiftShapes(state.shapes, shift);
         };
     }
     function handleEvents(state) {
@@ -2028,6 +2484,24 @@ window.createRunner = (state, clock = new Clock(state), maxRunTime = 1000 / 30, 
         }
         inputEvents.splice(0);
         events.splice(0);
+    }
+    function shiftShapes(shapes, delta) {
+        if (!shapes || !delta)
+            return;
+        for (let i = 0; i < shapes.length; i++) {
+            const shape = shapes[i];
+            const pts = shape.kind === 'plane' || shape.kind === 'disk' || shape.kind === 'box'
+                ? [shape.a]
+                : [shape.a, shape.b, shape.c];
+            for (let k = 0; k < pts.length; k++) {
+                const p = pts[k];
+                if (!p)
+                    continue;
+                p[0] -= delta[0];
+                p[1] -= delta[1];
+                p[2] -= delta[2];
+            }
+        }
     }
     function centerOn(mass, universe) {
         if (!mass)
@@ -2074,6 +2548,7 @@ function createUniverse(existingMasses) {
         ticksPerStep: 60,
         stepsPerSecond: 1,
         gravityConstant: 6.67408e-7,
+        coulombConstant: 0,
         speedlimit: 300000,
         fieldOfView: 120,
         maximumMasses: 8192,
@@ -2284,79 +2759,50 @@ function buildOctree(n) {
     }
     return root;
 }
-function gravityOctree(state) {
+function exactBodyForces(state) {
+    // The octree sorts bodies and answers ray queries. It does not
+    // approximate forces. Gravity and Coulomb are the exact pair formula.
     const universe = state.universe;
     const n = universe.length;
     const G = state.gravityConstant;
+    const K = state.coulombConstant || 0;
     const collisionList = state.collisionList;
     for (let i = 0; i < n; i++) {
-        const mass = universe[i];
-        const p = mass.position;
-        bodyX[i] = p[0];
-        bodyY[i] = p[1];
-        bodyZ[i] = p[2];
-        bodyM[i] = mass.mass;
-        bodyR[i] = mass.collisionSize;
-    }
-    const root = buildOctree(n);
-    for (let i = 0; i < n; i++) {
-        const mass = universe[i];
-        const g = mass.gravity;
-        const ix = bodyX[i], iy = bodyY[i], iz = bodyZ[i];
-        const si = bodyR[i], mi = bodyM[i];
-        let sp = 0;
-        octStack[sp++] = root;
-        while (sp > 0) {
-            const id = octStack[--sp];
-            const base = nodeChild[id];
-            if (base < 0) {
-                const st = nodeStart[id];
-                const len = nodeLen[id];
-                for (let k = 0; k < len; k++) {
-                    const j = bodyIdx[st + k];
-                    if (j === i)
-                        continue;
-                    const other = universe[j];
-                    const dx = bodyX[j] - ix, dy = bodyY[j] - iy, dz = bodyZ[j] - iz;
-                    const d2 = dx * dx + dy * dy + dz * dz;
-                    if (d2 < 1e-8)
-                        continue;
-                    const inv = G * mi * bodyM[j] / (d2 * Math.sqrt(d2));
-                    g[0] += dx * inv;
-                    g[1] += dy * inv;
-                    g[2] += dz * inv;
-                    if (j > i && Math.sqrt(d2) < si + bodyR[j]) {
-                        if (mi <= other.mass)
-                            collisionList.push([mass, other, i, j]);
-                        else
-                            collisionList.push([other, mass, j, i]);
-                    }
-                }
-                continue;
-            }
-            const dx = nodeComX[id] - ix, dy = nodeComY[id] - iy, dz = nodeComZ[id] - iz;
+        const a = universe[i];
+        const pa = a.position;
+        const ga = a.gravity;
+        const qa = a.charge || 0;
+        const ma = a.mass;
+        const sa = a.collisionSize;
+        for (let j = i + 1; j < n; j++) {
+            const b = universe[j];
+            const pb = b.position;
+            const dx = pb[0] - pa[0];
+            const dy = pb[1] - pa[1];
+            const dz = pb[2] - pa[2];
             const d2 = dx * dx + dy * dy + dz * dz;
-            const half = nodeHalf[id];
-            const pad = half + nodeRad[id] + si;
-            const ax = Math.abs(ix - nodeX[id]);
-            const ay = Math.abs(iy - nodeY[id]);
-            const az = Math.abs(iz - nodeZ[id]);
-            const size = half * 2;
-            // Open the cell if this body could touch anything in it. A
-            // center-of-mass sphere misses bodies sitting in a far corner.
-            const near = ax <= pad && ay <= pad && az <= pad;
-            if (!near && d2 > 1e-8 && size * size < d2 * OCTREE_THETA2) {
-                const inv = G * mi * nodeMass[id] / (d2 * Math.sqrt(d2));
-                g[0] += dx * inv;
-                g[1] += dy * inv;
-                g[2] += dz * inv;
+            if (!(d2 > 1e-8))
                 continue;
+            const inv = (G * ma * b.mass - K * qa * (b.charge || 0)) / (d2 * Math.sqrt(d2));
+            ga[0] += dx * inv;
+            ga[1] += dy * inv;
+            ga[2] += dz * inv;
+            const gb = b.gravity;
+            gb[0] -= dx * inv;
+            gb[1] -= dy * inv;
+            gb[2] -= dz * inv;
+            const reach = sa + b.collisionSize;
+            if (d2 < reach * reach) {
+                if (ma <= b.mass)
+                    collisionList.push([a, b, i, j]);
+                else
+                    collisionList.push([b, a, j, i]);
             }
-            for (let k = 0; k < 8; k++)
-                if (nodeLen[base + k] > 0 && sp < octStack.length)
-                    octStack[sp++] = base + k;
         }
-        div(g, g, mi);
+        const invM = 1 / ma;
+        ga[0] *= invM;
+        ga[1] *= invM;
+        ga[2] *= invM;
     }
 }
 function prepareRayTree(scene) {
@@ -2433,17 +2879,18 @@ function tick(state) {
     }
     function updateGravities(stateParts) {
         if (stateParts.universe.length >= GRAVITY_OCTREE_AT) {
-            gravityOctree(state);
+            exactBodyForces(state);
             return;
         }
-        const { universe, collisionList, ticksPerStep, gravityConstant, speedlimit } = stateParts;
+        const { universe, collisionList, ticksPerStep, gravityConstant, coulombConstant, speedlimit } = stateParts;
         for (let i = 0; i < universe.length; i++)
-            updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, speedlimit);
+            updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, coulombConstant || 0, speedlimit);
     }
-    function updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, speedlimit) {
+    function updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, coulombConstant, speedlimit) {
         const { position: p1, velocity: v1, acceleration: a1, gravity: g1, mass: m1, collisionSize: s1, collisions } = universe[i];
+        const q1 = universe[i].charge || 0;
         for (let j = i + 1; j < universe.length; j++)
-            updatePair(p1, v1, a1, g1, m1, s1, i, j, collisions, collisionList, universe, ticksPerStep, gravityConstant, speedlimit); //
+            updatePair(p1, v1, a1, g1, m1, s1, q1, i, j, collisions, collisionList, universe, ticksPerStep, gravityConstant, coulombConstant, speedlimit);
         if (collisions.length > 0) {
             for (let k = 0; k < collisions.length; k++)
                 collisionList.push(collisions[k]);
@@ -2452,11 +2899,12 @@ function tick(state) {
         // F = ma ... a = F/m
         div(g1, g1, m1);
     }
-    function updatePair(p1, v1, a1, g1, m1, s1, i, j, collisions, collisionList, universe, ticksPerStep, gravityConstant, speedlimit) {
+    function updatePair(p1, v1, a1, g1, m1, s1, q1, i, j, collisions, collisionList, universe, ticksPerStep, gravityConstant, coulombConstant, speedlimit) {
         const { position: p2, velocity: v2, acceleration: a2, mass: m2, collisionSize: s2, gravity: g2 } = universe[j];
+        const q2 = universe[j].charge || 0;
         sub(dd, p1, p2);
         const distance = magnitude(dd), t = -distance / (speedlimit * speedlimit), o = t / ticksPerStep;
-        updatePositionAndGravity(o, a1, a2, v1, v2, p1, p2, g1, g2, m1 * m2 * gravityConstant);
+        updatePositionAndGravity(o, a1, a2, v1, v2, p1, p2, g1, g2, m1 * m2 * gravityConstant - coulombConstant * q1 * q2);
         handleCollision(s1, s2, m1, m2, distance, i, j, collisionList, collisions, universe);
     }
     function updatePositionAndGravity(o, a1, a2, v1, v2, p1, p2, g1, g2, gravityScalar) {
@@ -2526,6 +2974,7 @@ function tick(state) {
             add(greaterMass.velocity, greaterMass.velocity, dd);
             div(greaterMass.velocity, greaterMass.velocity, total);
             greaterMass.mass = total;
+            greaterMass.charge = (greaterMass.charge || 0) + (smallerMass.charge || 0);
             const gi = universe.indexOf(greaterMass);
             if (gi >= 0) {
                 masses[gi] = greaterMass.mass;
@@ -2648,6 +3097,7 @@ class Mass {
         this.velocity = velocity;
         this.acceleration = acceleration;
         this.gravity = gravity;
+        this.charge = 0;
         this.collisions = [];
     }
     delayCreate(mass, color, position, velocity) {
@@ -2668,6 +3118,7 @@ class Mass {
         this.gravity[0] = 0;
         this.gravity[1] = 0;
         this.gravity[2] = 0;
+        this.charge = 0;
         this.collisions.splice(0);
     }
     set mass(value) { this._mass = value; this._sizeContainer[0] = Math.pow((3 / (4 * Math.PI)) * value, 1 / 3); }
