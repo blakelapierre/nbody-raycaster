@@ -2394,14 +2394,21 @@ function shapeBodies() {
     return bodies;
 }
 function shapePrimitives() {
-    return [
-        { kind: 'plane', a: [0, -90, 0], b: [0, 1, 0], color: [0.16, 0.18, 0.22, 1], reflectivity: 0.08 },
-        { kind: 'disk', a: [-90, 0, 36], b: [0, 0, 1], r: 22, color: [0.95, 0.5, 0.15, 1], reflectivity: 0.2 },
-        { kind: 'box', a: [-20, 8, 48], b: [16, 16, 16], color: [0.3, 0.78, 0.38, 1], reflectivity: 0.15 },
-        { kind: 'capsule', a: [40, -28, 36], b: [40, 32, 36], r: 10, color: [0.3, 0.85, 0.92, 1], reflectivity: 0.2 },
-        { kind: 'cylinder', a: [100, -32, 28], b: [100, 36, 28], r: 12, color: [0.58, 0.36, 0.92, 1], reflectivity: 0.15 },
-        { kind: 'triangle', a: [20, 55, 20], b: [78, 70, 8], c: [36, 28, 52], color: [0.9, 0.9, 0.84, 1], reflectivity: 0.5 }
+    const disk = { kind: 'disk', mass: 6000, charge: 1, velocity: [0.35, 0.02, -0.08], a: [-90, 0, 36], b: [0, 0, 1], r: 22, color: [0.95, 0.5, 0.15, 1], reflectivity: 0.2 };
+    const box = { kind: 'box', mass: 10000, charge: -1, velocity: [0.15, 0.04, -0.12], a: [-20, 8, 48], b: [16, 16, 16], color: [0.3, 0.78, 0.38, 1], reflectivity: 0.15 };
+    const capsule = { kind: 'capsule', mass: 5000, charge: 1, velocity: [-0.22, 0.05, -0.05], a: [40, -28, 36], b: [40, 32, 36], r: 10, color: [0.3, 0.85, 0.92, 1], reflectivity: 0.2 };
+    const cylinder = { kind: 'cylinder', mass: 8000, charge: 0, velocity: [-0.05, -0.85, 0.04], a: [100, -32, 28], b: [100, 36, 28], r: 12, color: [0.58, 0.36, 0.92, 1], reflectivity: 0.15 };
+    const triangle = { kind: 'triangle', mass: 3500, charge: 2, velocity: [-0.28, -0.12, -0.04], a: [20, 55, 20], b: [78, 70, 8], c: [36, 28, 52], color: [0.9, 0.9, 0.84, 1], reflectivity: 0.5 };
+    const shapes = [
+        { kind: 'plane', fixed: true, a: [0, -90, 0], b: [0, 1, 0], color: [0.16, 0.18, 0.22, 1], reflectivity: 0.08 },
+        disk, box, capsule, cylinder, triangle
     ];
+    for (let i = 0; i < shapes.length; i++) {
+        if (!shapes[i].velocity)
+            shapes[i].velocity = [0, 0, 0];
+        shapes[i].gravity = [0, 0, 0];
+    }
+    return shapes;
 }
 function centerUniverse(state) {
     const mass = state.currentCameraTarget;
@@ -2490,9 +2497,7 @@ window.createRunner = (state, clock = new Clock(state), maxRunTime = 1000 / 30, 
             return;
         for (let i = 0; i < shapes.length; i++) {
             const shape = shapes[i];
-            const pts = shape.kind === 'plane' || shape.kind === 'disk' || shape.kind === 'box'
-                ? [shape.a]
-                : [shape.a, shape.b, shape.c];
+            const pts = shapePoints(shape);
             for (let k = 0; k < pts.length; k++) {
                 const p = pts[k];
                 if (!p)
@@ -2864,27 +2869,452 @@ function packGpuNodes(count) {
     }
     return true;
 }
+function shapePoints(shape) {
+    if (shape.kind === 'plane' || shape.kind === 'disk' || shape.kind === 'box')
+        return [shape.a];
+    if (shape.kind === 'triangle')
+        return [shape.a, shape.b, shape.c];
+    return [shape.a, shape.b];
+}
+function shapeCenter(shape, out) {
+    const c = out || [0, 0, 0];
+    if (shape.kind === 'capsule' || shape.kind === 'cylinder') {
+        c[0] = (shape.a[0] + shape.b[0]) * 0.5;
+        c[1] = (shape.a[1] + shape.b[1]) * 0.5;
+        c[2] = (shape.a[2] + shape.b[2]) * 0.5;
+        return c;
+    }
+    if (shape.kind === 'triangle') {
+        c[0] = (shape.a[0] + shape.b[0] + shape.c[0]) / 3;
+        c[1] = (shape.a[1] + shape.b[1] + shape.c[1]) / 3;
+        c[2] = (shape.a[2] + shape.b[2] + shape.c[2]) / 3;
+        return c;
+    }
+    c[0] = shape.a[0];
+    c[1] = shape.a[1];
+    c[2] = shape.a[2];
+    return c;
+}
+function translateShape(shape, delta) {
+    const pts = shapePoints(shape);
+    for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        if (!p)
+            continue;
+        p[0] += delta[0];
+        p[1] += delta[1];
+        p[2] += delta[2];
+    }
+}
+function shapeHalf(shapes, ticksPerStep) {
+    if (!shapes)
+        return;
+    const dt = 1 / ticksPerStep;
+    for (let i = 0; i < shapes.length; i++) {
+        const shape = shapes[i];
+        if (shape.fixed || !(shape.mass > 0))
+            continue;
+        const v = shape.velocity;
+        translateShape(shape, [v[0] * dt * 0.5, v[1] * dt * 0.5, v[2] * dt * 0.5]);
+        shape.gravity[0] = 0;
+        shape.gravity[1] = 0;
+        shape.gravity[2] = 0;
+    }
+}
+function shapeKick(shapes, ticksPerStep) {
+    if (!shapes)
+        return;
+    const dt = 1 / ticksPerStep;
+    for (let i = 0; i < shapes.length; i++) {
+        const shape = shapes[i];
+        if (shape.fixed || !(shape.mass > 0))
+            continue;
+        const v = shape.velocity;
+        const g = shape.gravity;
+        v[0] += g[0] * dt;
+        v[1] += g[1] * dt;
+        v[2] += g[2] * dt;
+        translateShape(shape, [v[0] * dt * 0.5, v[1] * dt * 0.5, v[2] * dt * 0.5]);
+    }
+}
+function shapeForces(state) {
+    const shapes = state.shapes;
+    if (!shapes || !shapes.length)
+        return;
+    const universe = state.universe;
+    const G = state.gravityConstant;
+    const K = state.coulombConstant || 0;
+    const center = [0, 0, 0];
+    const otherCenter = [0, 0, 0];
+    for (let s = 0; s < shapes.length; s++) {
+        const shape = shapes[s];
+        if (!(shape.mass > 0) || shape.fixed)
+            continue;
+        shapeCenter(shape, center);
+        const ms = shape.mass;
+        const qs = shape.charge || 0;
+        for (let i = 0; i < universe.length; i++) {
+            const body = universe[i];
+            const p = body.position;
+            const dx = center[0] - p[0];
+            const dy = center[1] - p[1];
+            const dz = center[2] - p[2];
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (!(d2 > 1e-6))
+                continue;
+            const force = (G * body.mass * ms - K * (body.charge || 0) * qs) / (d2 * Math.sqrt(d2));
+            const im = 1 / body.mass;
+            const sm = 1 / ms;
+            body.gravity[0] += dx * force * im;
+            body.gravity[1] += dy * force * im;
+            body.gravity[2] += dz * force * im;
+            shape.gravity[0] -= dx * force * sm;
+            shape.gravity[1] -= dy * force * sm;
+            shape.gravity[2] -= dz * force * sm;
+        }
+        for (let t = s + 1; t < shapes.length; t++) {
+            const other = shapes[t];
+            if (!(other.mass > 0) || other.fixed)
+                continue;
+            shapeCenter(other, otherCenter);
+            const dx = otherCenter[0] - center[0];
+            const dy = otherCenter[1] - center[1];
+            const dz = otherCenter[2] - center[2];
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (!(d2 > 1e-6))
+                continue;
+            const mo = other.mass;
+            const force = (G * ms * mo - K * qs * (other.charge || 0)) / (d2 * Math.sqrt(d2));
+            shape.gravity[0] += dx * force / ms;
+            shape.gravity[1] += dy * force / ms;
+            shape.gravity[2] += dz * force / ms;
+            other.gravity[0] -= dx * force / mo;
+            other.gravity[1] -= dy * force / mo;
+            other.gravity[2] -= dz * force / mo;
+        }
+    }
+}
+function unit3(x, y, z) {
+    const len = Math.hypot(x, y, z) || 1;
+    return [x / len, y / len, z / len];
+}
+function sphereShapeContact(body, shape) {
+    const p = body.position;
+    const rad = body.size;
+    if (shape.kind === 'plane' || shape.kind === 'disk') {
+        const n = unit3(shape.b[0], shape.b[1], shape.b[2]);
+        const relX = p[0] - shape.a[0];
+        const relY = p[1] - shape.a[1];
+        const relZ = p[2] - shape.a[2];
+        const along = relX * n[0] + relY * n[1] + relZ * n[2];
+        const px = relX - n[0] * along;
+        const py = relY - n[1] * along;
+        const pz = relZ - n[2] * along;
+        const planar = Math.hypot(px, py, pz);
+        if (shape.kind === 'disk' && planar > shape.r) {
+            const scale = shape.r / planar;
+            const cx = shape.a[0] + px * scale;
+            const cy = shape.a[1] + py * scale;
+            const cz = shape.a[2] + pz * scale;
+            const dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
+            const dist = Math.hypot(dx, dy, dz);
+            if (!(dist < rad) || dist < 1e-8)
+                return null;
+            return { n: [dx / dist, dy / dist, dz / dist], pen: rad - dist };
+        }
+        if (Math.abs(along) >= rad)
+            return null;
+        const sign = along >= 0 ? 1 : -1;
+        return { n: [n[0] * sign, n[1] * sign, n[2] * sign], pen: rad - Math.abs(along) };
+    }
+    if (shape.kind === 'box') {
+        const c = shape.a;
+        const h = shape.b;
+        const q0 = p[0] - c[0], q1 = p[1] - c[1], q2 = p[2] - c[2];
+        const c0 = Math.max(-h[0], Math.min(h[0], q0));
+        const c1 = Math.max(-h[1], Math.min(h[1], q1));
+        const c2 = Math.max(-h[2], Math.min(h[2], q2));
+        const inside = q0 === c0 && q1 === c1 && q2 === c2;
+        if (!inside) {
+            const dx = q0 - c0, dy = q1 - c1, dz = q2 - c2;
+            const dist = Math.hypot(dx, dy, dz);
+            if (!(dist < rad) || dist < 1e-8)
+                return null;
+            return { n: [dx / dist, dy / dist, dz / dist], pen: rad - dist };
+        }
+        const faces = [[h[0] - q0, 0, 1], [q0 + h[0], 0, -1], [h[1] - q1, 1, 1], [q1 + h[1], 1, -1], [h[2] - q2, 2, 1], [q2 + h[2], 2, -1]];
+        let best = faces[0];
+        for (let i = 1; i < faces.length; i++)
+            if (faces[i][0] < best[0])
+                best = faces[i];
+        const n = [0, 0, 0];
+        n[best[1]] = best[2];
+        return { n, pen: best[0] + rad };
+    }
+    if (shape.kind === 'capsule')
+        return segmentContact(p, rad, shape.a, shape.b, shape.r);
+    if (shape.kind === 'cylinder')
+        return cylinderContact(p, rad, shape.a, shape.b, shape.r);
+    if (shape.kind === 'triangle')
+        return triangleContact(p, rad, shape.a, shape.b, shape.c);
+    return null;
+}
+function segmentContact(p, rad, a, b, extra) {
+    const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+    const ab2 = abx * abx + aby * aby + abz * abz || 1e-8;
+    let t = ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby + (p[2] - a[2]) * abz) / ab2;
+    if (t < 0)
+        t = 0;
+    else if (t > 1)
+        t = 1;
+    const cx = a[0] + abx * t, cy = a[1] + aby * t, cz = a[2] + abz * t;
+    const dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
+    const dist = Math.hypot(dx, dy, dz);
+    const reach = rad + extra;
+    if (!(dist < reach))
+        return null;
+    if (dist < 1e-6)
+        return { n: [0, 1, 0], pen: reach };
+    return { n: [dx / dist, dy / dist, dz / dist], pen: reach - dist };
+}
+function cylinderContact(p, rad, a, b, radius) {
+    const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+    const abLen = Math.hypot(abx, aby, abz) || 1e-8;
+    const nx = abx / abLen, ny = aby / abLen, nz = abz / abLen;
+    const apx = p[0] - a[0], apy = p[1] - a[1], apz = p[2] - a[2];
+    const axial = apx * nx + apy * ny + apz * nz;
+    const rx = apx - nx * axial, ry = apy - ny * axial, rz = apz - nz * axial;
+    const radLen = Math.hypot(rx, ry, rz);
+    if (axial >= 0 && axial <= abLen) {
+        if (radLen > radius) {
+            const dist = radLen - radius;
+            if (!(dist < rad) || radLen < 1e-8)
+                return null;
+            return { n: [rx / radLen, ry / radLen, rz / radLen], pen: rad - dist };
+        }
+        const n = radLen > 1e-6 ? [rx / radLen, ry / radLen, rz / radLen] : [1, 0, 0];
+        return { n, pen: rad + (radius - radLen) };
+    }
+    const cap = axial < 0 ? a : b;
+    const ox = axial < 0 ? -nx : nx, oy = axial < 0 ? -ny : ny, oz = axial < 0 ? -nz : nz;
+    const tx = p[0] - cap[0], ty = p[1] - cap[1], tz = p[2] - cap[2];
+    const along = tx * ox + ty * oy + tz * oz;
+    const ix = tx - ox * along, iy = ty - oy * along, iz = tz - oz * along;
+    const inLen = Math.hypot(ix, iy, iz);
+    let cx, cy, cz;
+    if (inLen > radius && inLen > 1e-8) {
+        const s = radius / inLen;
+        cx = cap[0] + ix * s;
+        cy = cap[1] + iy * s;
+        cz = cap[2] + iz * s;
+    }
+    else {
+        cx = cap[0] + ix;
+        cy = cap[1] + iy;
+        cz = cap[2] + iz;
+    }
+    const dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
+    const dist = Math.hypot(dx, dy, dz);
+    if (!(dist < rad) || dist < 1e-8)
+        return null;
+    return { n: [dx / dist, dy / dist, dz / dist], pen: rad - dist };
+}
+function triangleContact(p, rad, a, b, c) {
+    const closest = closestOnTriangle(p, a, b, c);
+    const dx = p[0] - closest[0], dy = p[1] - closest[1], dz = p[2] - closest[2];
+    const dist = Math.hypot(dx, dy, dz);
+    if (!(dist < rad))
+        return null;
+    if (dist < 1e-6) {
+        const e1x = b[0] - a[0], e1y = b[1] - a[1], e1z = b[2] - a[2];
+        const e2x = c[0] - a[0], e2y = c[1] - a[1], e2z = c[2] - a[2];
+        const n = unit3(e1y * e2z - e1z * e2y, e1z * e2x - e1x * e2z, e1x * e2y - e1y * e2x);
+        return { n, pen: rad };
+    }
+    return { n: [dx / dist, dy / dist, dz / dist], pen: rad - dist };
+}
+function closestOnTriangle(p, a, b, c) {
+    const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+    const acx = c[0] - a[0], acy = c[1] - a[1], acz = c[2] - a[2];
+    const apx = p[0] - a[0], apy = p[1] - a[1], apz = p[2] - a[2];
+    const d1 = abx * apx + aby * apy + abz * apz;
+    const d2 = acx * apx + acy * apy + acz * apz;
+    if (d1 <= 0 && d2 <= 0)
+        return [a[0], a[1], a[2]];
+    const bpx = p[0] - b[0], bpy = p[1] - b[1], bpz = p[2] - b[2];
+    const d3 = abx * bpx + aby * bpy + abz * bpz;
+    const d4 = acx * bpx + acy * bpy + acz * bpz;
+    if (d3 >= 0 && d4 <= d3)
+        return [b[0], b[1], b[2]];
+    const vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+        const v = d1 / (d1 - d3);
+        return [a[0] + abx * v, a[1] + aby * v, a[2] + abz * v];
+    }
+    const cpx = p[0] - c[0], cpy = p[1] - c[1], cpz = p[2] - c[2];
+    const d5 = abx * cpx + aby * cpy + abz * cpz;
+    const d6 = acx * cpx + acy * cpy + acz * cpz;
+    if (d6 >= 0 && d5 <= d6)
+        return [c[0], c[1], c[2]];
+    const vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+        const w = d2 / (d2 - d6);
+        return [a[0] + acx * w, a[1] + acy * w, a[2] + acz * w];
+    }
+    const va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 >= d3 && d5 >= d6) {
+        const w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return [b[0] + (c[0] - b[0]) * w, b[1] + (c[1] - b[1]) * w, b[2] + (c[2] - b[2]) * w];
+    }
+    const denom = 1 / (va + vb + vc);
+    const v = vb * denom;
+    const w = vc * denom;
+    return [a[0] + abx * v + acx * w, a[1] + aby * v + acy * w, a[2] + abz * v + acz * w];
+}
+function shapeSupport(shape, n) {
+    if (shape.kind === 'disk') {
+        const dn = unit3(shape.b[0], shape.b[1], shape.b[2]);
+        const axial = n[0] * dn[0] + n[1] * dn[1] + n[2] * dn[2];
+        const tx = n[0] - dn[0] * axial;
+        const ty = n[1] - dn[1] * axial;
+        const tz = n[2] - dn[2] * axial;
+        const tl = Math.hypot(tx, ty, tz);
+        if (tl < 1e-8)
+            return [shape.a[0], shape.a[1], shape.a[2]];
+        const s = shape.r / tl;
+        return [shape.a[0] - tx * s, shape.a[1] - ty * s, shape.a[2] - tz * s];
+    }
+    if (shape.kind === 'box') {
+        const h = shape.b;
+        return [
+            shape.a[0] - Math.sign(n[0]) * h[0],
+            shape.a[1] - Math.sign(n[1]) * h[1],
+            shape.a[2] - Math.sign(n[2]) * h[2]
+        ];
+    }
+    if (shape.kind === 'cylinder') {
+        const abx = shape.b[0] - shape.a[0], aby = shape.b[1] - shape.a[1], abz = shape.b[2] - shape.a[2];
+        const abLen = Math.hypot(abx, aby, abz) || 1;
+        const ax = abx / abLen, ay = aby / abLen, az = abz / abLen;
+        const da = shape.a[0] * n[0] + shape.a[1] * n[1] + shape.a[2] * n[2];
+        const db = shape.b[0] * n[0] + shape.b[1] * n[1] + shape.b[2] * n[2];
+        const end = da < db ? shape.a : shape.b;
+        const axial = n[0] * ax + n[1] * ay + n[2] * az;
+        const tx = n[0] - ax * axial, ty = n[1] - ay * axial, tz = n[2] - az * axial;
+        const tl = Math.hypot(tx, ty, tz);
+        if (tl < 1e-8)
+            return [end[0], end[1], end[2]];
+        const s = shape.r / tl;
+        return [end[0] - tx * s, end[1] - ty * s, end[2] - tz * s];
+    }
+    if (shape.kind === 'capsule') {
+        const da = shape.a[0] * n[0] + shape.a[1] * n[1] + shape.a[2] * n[2];
+        const db = shape.b[0] * n[0] + shape.b[1] * n[1] + shape.b[2] * n[2];
+        const end = da < db ? shape.a : shape.b;
+        return [end[0] - n[0] * shape.r, end[1] - n[1] * shape.r, end[2] - n[2] * shape.r];
+    }
+    if (shape.kind === 'triangle') {
+        const pts = [shape.a, shape.b, shape.c];
+        let best = pts[0];
+        let bestD = best[0] * n[0] + best[1] * n[1] + best[2] * n[2];
+        for (let i = 1; i < pts.length; i++) {
+            const d = pts[i][0] * n[0] + pts[i][1] * n[1] + pts[i][2] * n[2];
+            if (d < bestD) {
+                best = pts[i];
+                bestD = d;
+            }
+        }
+        return [best[0], best[1], best[2]];
+    }
+    return [shape.a[0], shape.a[1], shape.a[2]];
+}
+function bouncePair(v1, m1, v2, m2, n, restitution) {
+    const rel = (v1[0] - (v2 ? v2[0] : 0)) * n[0] + (v1[1] - (v2 ? v2[1] : 0)) * n[1] + (v1[2] - (v2 ? v2[2] : 0)) * n[2];
+    if (!(rel < 0))
+        return;
+    const inv = 1 / m1 + (m2 ? 1 / m2 : 0);
+    const j = -(1 + restitution) * rel / inv;
+    v1[0] += n[0] * j / m1;
+    v1[1] += n[1] * j / m1;
+    v1[2] += n[2] * j / m1;
+    if (v2 && m2) {
+        v2[0] -= n[0] * j / m2;
+        v2[1] -= n[1] * j / m2;
+        v2[2] -= n[2] * j / m2;
+    }
+}
+function separatePair(body, shape, n, pen) {
+    const slop = 0.04;
+    const depth = pen - slop;
+    if (!(depth > 0))
+        return;
+    const fixed = shape.fixed || !(shape.mass > 0);
+    const share = fixed ? 1 : shape.mass / (body.mass + shape.mass);
+    body.position[0] += n[0] * depth * share;
+    body.position[1] += n[1] * depth * share;
+    body.position[2] += n[2] * depth * share;
+    if (!fixed)
+        translateShape(shape, [-n[0] * depth * (1 - share), -n[1] * depth * (1 - share), -n[2] * depth * (1 - share)]);
+}
+function collideShapes(state) {
+    const shapes = state.shapes;
+    if (!shapes || !shapes.length)
+        return;
+    const universe = state.universe;
+    for (let s = 0; s < shapes.length; s++) {
+        const shape = shapes[s];
+        for (let i = 0; i < universe.length; i++) {
+            const body = universe[i];
+            const hit = sphereShapeContact(body, shape);
+            if (!hit)
+                continue;
+            separatePair(body, shape, hit.n, hit.pen);
+            bouncePair(body.velocity, body.mass, shape.fixed ? null : shape.velocity, shape.fixed ? 0 : shape.mass, hit.n, 0.35);
+        }
+    }
+    for (let s = 0; s < shapes.length; s++) {
+        const shape = shapes[s];
+        if (shape.fixed || !(shape.mass > 0))
+            continue;
+        for (let p = 0; p < shapes.length; p++) {
+            const plane = shapes[p];
+            if (plane.kind !== 'plane')
+                continue;
+            const n = unit3(plane.b[0], plane.b[1], plane.b[2]);
+            const support = shapeSupport(shape, n);
+            const gap = (support[0] - plane.a[0]) * n[0] + (support[1] - plane.a[1]) * n[1] + (support[2] - plane.a[2]) * n[2];
+            if (!(gap < 0))
+                continue;
+            translateShape(shape, [-n[0] * gap, -n[1] * gap, -n[2] * gap]);
+            bouncePair(shape.velocity, shape.mass, null, 0, n, 0.4);
+        }
+    }
+}
 function tick(state) {
     state.currentTick++;
     positionHalfTick(state);
     updateGravities(state);
     updateVelocities(state);
     resolveCollisions(state);
-    function positionHalfTick({ universe, ticksPerStep }) {
+    collideShapes(state);
+    function positionHalfTick({ universe, ticksPerStep, shapes }) {
         for (let i = 0; i < universe.length; i++) {
             const mass = universe[i];
             mass.positionHalfTick(ticksPerStep);
             set(mass.gravity, 0, 0, 0);
         }
+        shapeHalf(shapes, ticksPerStep);
     }
     function updateGravities(stateParts) {
         if (stateParts.universe.length >= GRAVITY_OCTREE_AT) {
             exactBodyForces(state);
+            shapeForces(stateParts);
             return;
         }
         const { universe, collisionList, ticksPerStep, gravityConstant, coulombConstant, speedlimit } = stateParts;
         for (let i = 0; i < universe.length; i++)
             updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, coulombConstant || 0, speedlimit);
+        shapeForces(stateParts);
     }
     function updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, coulombConstant, speedlimit) {
         const { position: p1, velocity: v1, acceleration: a1, gravity: g1, mass: m1, collisionSize: s1, collisions } = universe[i];
@@ -2941,8 +3371,9 @@ function tick(state) {
                 collisions.push([universe[j], universe[i], j, i]);
         }
     }
-    function updateVelocities({ universe, ticksPerStep }) {
+    function updateVelocities({ universe, ticksPerStep, shapes }) {
         universe.forEach(mass => updateMassVelocityAndPartialPosition(mass, ticksPerStep));
+        shapeKick(shapes, ticksPerStep);
     }
     function updateMassVelocityAndPartialPosition(mass, ticksPerStep) {
         mass.velocityTick(ticksPerStep);
