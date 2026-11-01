@@ -242,19 +242,71 @@ const traceRay = (dir, origin, scene, base, stepsLeft) => {
     let bestSphere = null;
     let bestPoint = null;
     let bestT = Infinity;
-    for (let i = 0; i < objects.length; i++) {
-        const object = objects[i];
-        if (object[0] !== 'sphere')
-            continue;
-        const intersection = sphereRayIntersection(object[1], ray);
-        if (!intersection)
-            continue;
-        const t = vLength(vDifference(origin, intersection));
-        if (t < REFLECT_BIAS * 0.4 || t >= bestT)
-            continue;
-        bestT = t;
-        bestSphere = object[1];
-        bestPoint = intersection;
+    const root = scene._rayRoot;
+    if (root >= 0) {
+        const invX = 1 / (dir[0] || 1e-12);
+        const invY = 1 / (dir[1] || 1e-12);
+        const invZ = 1 / (dir[2] || 1e-12);
+        let sp = 0;
+        octStack[sp++] = root;
+        while (sp > 0) {
+            const id = octStack[--sp];
+            const hx = nodeHalf[id] + nodeRad[id];
+            let t1 = (nodeX[id] - hx - origin[0]) * invX;
+            let t2 = (nodeX[id] + hx - origin[0]) * invX;
+            let tmin = t1 < t2 ? t1 : t2;
+            let tmax = t1 < t2 ? t2 : t1;
+            t1 = (nodeY[id] - hx - origin[1]) * invY;
+            t2 = (nodeY[id] + hx - origin[1]) * invY;
+            const y0 = t1 < t2 ? t1 : t2, y1 = t1 < t2 ? t2 : t1;
+            if (y0 > tmin) tmin = y0;
+            if (y1 < tmax) tmax = y1;
+            t1 = (nodeZ[id] - hx - origin[2]) * invZ;
+            t2 = (nodeZ[id] + hx - origin[2]) * invZ;
+            const z0 = t1 < t2 ? t1 : t2, z1 = t1 < t2 ? t2 : t1;
+            if (z0 > tmin) tmin = z0;
+            if (z1 < tmax) tmax = z1;
+            if (tmax < (tmin > 0 ? tmin : 0) || tmin >= bestT)
+                continue;
+            const child = nodeChild[id];
+            if (child < 0) {
+                const st = nodeStart[id];
+                const len = nodeLen[id];
+                for (let k = 0; k < len; k++) {
+                    const sphere = rayObjs[bodyIdx[st + k]];
+                    const intersection = sphereRayIntersection(sphere, ray);
+                    if (!intersection)
+                        continue;
+                    const t = vLength(vDifference(origin, intersection));
+                    if (t < REFLECT_BIAS * 0.4 || t >= bestT)
+                        continue;
+                    bestT = t;
+                    bestSphere = sphere;
+                    bestPoint = intersection;
+                }
+            }
+            else {
+                for (let k = 0; k < 8; k++)
+                    if (nodeLen[child + k] > 0 && sp < octStack.length)
+                        octStack[sp++] = child + k;
+            }
+        }
+    }
+    else {
+        for (let i = 0; i < objects.length; i++) {
+            const object = objects[i];
+            if (object[0] !== 'sphere')
+                continue;
+            const intersection = sphereRayIntersection(object[1], ray);
+            if (!intersection)
+                continue;
+            const t = vLength(vDifference(origin, intersection));
+            if (t < REFLECT_BIAS * 0.4 || t >= bestT)
+                continue;
+            bestT = t;
+            bestSphere = object[1];
+            bestPoint = intersection;
+        }
     }
     if (!bestSphere)
         return base;
@@ -479,9 +531,11 @@ const paint = (data, context) => {
 };
 let frame;
 const MAX_SPHERES = 64;
+const MAX_GPU_NODES = 512;
 const gpuSphereData = new Float32Array(MAX_SPHERES * 4);
 const gpuColorData = new Float32Array(MAX_SPHERES * 4);
 const gpuTexRectData = new Float32Array(MAX_SPHERES * 4);
+const gpuNodeData = new Float32Array(MAX_GPU_NODES * 16);
 const gpuAtlasData = new Uint8Array(ATLAS * ATLAS * 4);
 const blitTexture = (tile, tex) => {
     const col = tile % ATLAS_TILES;
@@ -543,7 +597,8 @@ in vec2 vUV;
 out vec4 fragColor;
 void main() { fragColor = texture(uHold, vUV); }`;
     // Same rays as project(), same quadratic as sphereRayIntersection(), closest hit wins.
-    const fragSrc = `#version 300 es
+    const fragSrc = (tree) => `#version 300 es
+#define TREE ${tree}
 precision highp float;
 uniform vec3 uOrigin;
 uniform vec4 uQ;
@@ -552,6 +607,9 @@ uniform float uAspect;
 uniform float uPlane;
 uniform vec2 uRes;
 uniform int uCount;
+#if TREE
+uniform sampler2D uNodes;
+#endif
 uniform sampler2D uSpheres;
 uniform sampler2D uColors;
 uniform sampler2D uTexRects;
@@ -576,6 +634,138 @@ vec3 albedo(vec3 n, int i) {
     vec2 uv = rect.xy + vec2(pad) + vec2(u, v) * (rect.z - pad * 2.0);
     return texture(uAtlas, uv).rgb;
 }
+#if TREE
+bool nodeBox(vec3 ro, vec3 rd, vec3 c, float h, float limit) {
+    vec3 inv = vec3(rd.x == 0.0 ? 1e30 : 1.0 / rd.x, rd.y == 0.0 ? 1e30 : 1.0 / rd.y, rd.z == 0.0 ? 1e30 : 1.0 / rd.z);
+    vec3 t1 = (c - h - ro) * inv;
+    vec3 t2 = (c + h - ro) * inv;
+    vec3 tmin3 = min(t1, t2);
+    vec3 tmax3 = max(t1, t2);
+    float tEnter = max(max(tmin3.x, tmin3.y), tmin3.z);
+    float tExit = min(min(tmax3.x, tmax3.y), tmax3.z);
+    return tExit >= max(tEnter, 0.0) && tEnter < limit;
+}
+void considerSphere(int i, vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP, inout vec3 hitC, inout float hitRef, inout int bestI, inout bool found) {
+    if (i < 0 || i >= uCount)
+        return;
+    vec4 sphere = texelFetch(uSpheres, ivec2(i, 0), 0);
+    vec3 oc = sphere.xyz - ro;
+    float a = dot(rd, rd);
+    float b = dot(rd, oc);
+    float c = dot(oc, oc) - sphere.w * sphere.w;
+    float delta = b * b - a * c;
+    if (a == 0.0 || delta < 0.0)
+        return;
+    float root = sqrt(delta);
+    float t = (b - root) / a;
+    if (t < 0.0)
+        t = (b + root) / a;
+    if (t < 0.0)
+        return;
+    vec3 at = ro + rd * t;
+    float dist = length(at - ro);
+    if (dist < 0.02 || dist >= bestT)
+        return;
+    bestT = dist;
+    hitP = at;
+    hitC = sphere.xyz;
+    hitRef = texelFetch(uColors, ivec2(i, 0), 0).a;
+    bestI = i;
+    found = true;
+}
+void walkSpheres(vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP, inout vec3 hitC, inout float hitRef, inout int bestI, inout bool found) {
+    int stack[64];
+    int sp = 1;
+    stack[0] = 0;
+    for (int step = 0; step < 128; step++) {
+        if (sp <= 0)
+            break;
+        sp -= 1;
+        int id = stack[sp];
+        vec4 box = texelFetch(uNodes, ivec2(0, id), 0);
+        vec4 meta = texelFetch(uNodes, ivec2(1, id), 0);
+        if (meta.y < 0.5 || !nodeBox(ro, rd, box.xyz, box.w, bestT))
+            continue;
+        if (meta.x < 0.0) {
+            int len = int(meta.y + 0.5);
+            vec4 extra = texelFetch(uNodes, ivec2(2, id), 0);
+            vec4 tail = texelFetch(uNodes, ivec2(3, id), 0);
+            if (len > 0) considerSphere(int(meta.z + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+            if (len > 1) considerSphere(int(meta.w + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+            if (len > 2) considerSphere(int(extra.x + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+            if (len > 3) considerSphere(int(extra.y + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+            if (len > 4) considerSphere(int(extra.z + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+            if (len > 5) considerSphere(int(extra.w + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+            if (len > 6) considerSphere(int(tail.x + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+            if (len > 7) considerSphere(int(tail.y + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+        } else {
+            int child = int(meta.x + 0.5);
+            for (int k = 7; k >= 0; k--) {
+                vec4 cm = texelFetch(uNodes, ivec2(1, child + k), 0);
+                if (cm.y > 0.5 && sp < 64)
+                    stack[sp++] = child + k;
+            }
+        }
+    }
+}
+bool treeBlocks(vec3 sro, vec3 ld, float lightT) {
+    int stack[64];
+    int sp = 1;
+    stack[0] = 0;
+    for (int step = 0; step < 128; step++) {
+        if (sp <= 0)
+            break;
+        sp -= 1;
+        int id = stack[sp];
+        vec4 box = texelFetch(uNodes, ivec2(0, id), 0);
+        vec4 meta = texelFetch(uNodes, ivec2(1, id), 0);
+        if (meta.y < 0.5 || !nodeBox(sro, ld, box.xyz, box.w, lightT))
+            continue;
+        if (meta.x < 0.0) {
+            int len = int(meta.y + 0.5);
+            vec4 extra = texelFetch(uNodes, ivec2(2, id), 0);
+            vec4 tail = texelFetch(uNodes, ivec2(3, id), 0);
+            int ids[8];
+            ids[0] = int(meta.z + 0.5);
+            ids[1] = int(meta.w + 0.5);
+            ids[2] = int(extra.x + 0.5);
+            ids[3] = int(extra.y + 0.5);
+            ids[4] = int(extra.z + 0.5);
+            ids[5] = int(extra.w + 0.5);
+            ids[6] = int(tail.x + 0.5);
+            ids[7] = int(tail.y + 0.5);
+            for (int k = 0; k < 8; k++) {
+                if (k >= len)
+                    break;
+                int j = ids[k];
+                if (j <= 0 || j >= uCount)
+                    continue;
+                vec4 sph = texelFetch(uSpheres, ivec2(j, 0), 0);
+                vec3 soc = sph.xyz - sro;
+                float sb = dot(ld, soc);
+                float sc = dot(soc, soc) - sph.w * sph.w;
+                float sd = sb * sb - sc;
+                if (sd < 0.0)
+                    continue;
+                float sroot = sqrt(sd);
+                float st = sb - sroot;
+                if (st < 0.0)
+                    st = sb + sroot;
+                if (st > 0.02 && st < lightT)
+                    return true;
+            }
+        } else {
+            int child = int(meta.x + 0.5);
+            for (int k = 7; k >= 0; k--) {
+                vec4 cm = texelFetch(uNodes, ivec2(1, child + k), 0);
+                if (cm.y > 0.5 && sp < 64)
+                    stack[sp++] = child + k;
+            }
+        }
+    }
+    return false;
+}
+#endif
 void main() {
     float uu = vRay.x;
     float vv = vRay.y;
@@ -592,6 +782,9 @@ void main() {
         float hitRef = 0.0;
         int bestI = 0;
         bool found = false;
+#if TREE
+        walkSpheres(ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
+#else
         for (int i = 0; i < ${MAX_SPHERES}; i++) {
             if (i >= uCount)
                 break;
@@ -620,6 +813,7 @@ void main() {
             bestI = i;
             found = true;
         }
+#endif
         if (!found)
             break;
         vec3 nrm = normalize(hitP - hitC);
@@ -633,6 +827,10 @@ void main() {
             float shade = ndl < 0.0 ? 0.34 : 1.0;
             vec3 sro = hitP + ld * 0.05;
             float lightT = distL - sun.w - 0.05;
+#if TREE
+            if (treeBlocks(sro, ld, lightT))
+                shade = min(shade, 0.28);
+#else
             for (int j = 1; j < ${MAX_SPHERES}; j++) {
                 if (j >= uCount)
                     break;
@@ -652,6 +850,7 @@ void main() {
                     break;
                 }
             }
+#endif
             hitRgb *= shade;
         }
         float mirror = bounce == 4 ? 0.0 : clamp(hitRef, 0.0, 1.0);
@@ -677,7 +876,10 @@ void main() {
         return shader;
     };
     const vs = compile(gl.VERTEX_SHADER, vert);
-    const fs = compile(gl.FRAGMENT_SHADER, fragSrc);
+    const fs = compile(gl.FRAGMENT_SHADER, fragSrc(0));
+    // The tree walk is slower than the direct loop at the 64 spheres this
+    // GPU path can draw, so it is not compiled. CPU rays still use the octree.
+    const treeFs = null;
     if (!vs || !fs)
         return null;
     const program = gl.createProgram();
@@ -688,6 +890,18 @@ void main() {
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
         console.error(gl.getProgramInfoLog(program));
         return null;
+    }
+    let treeProgram = null;
+    if (treeFs) {
+        treeProgram = gl.createProgram();
+        gl.attachShader(treeProgram, vs);
+        gl.attachShader(treeProgram, treeFs);
+        gl.bindAttribLocation(treeProgram, 0, 'aPos');
+        gl.linkProgram(treeProgram);
+        if (!gl.getProgramParameter(treeProgram, gl.LINK_STATUS)) {
+            console.error(gl.getProgramInfoLog(treeProgram));
+            treeProgram = null;
+        }
     }
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -715,6 +929,14 @@ void main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, ATLAS, ATLAS, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const nodeTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE5);
+    gl.bindTexture(gl.TEXTURE_2D, nodeTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 4, MAX_GPU_NODES, 0, gl.RGBA, gl.FLOAT, null);
     const loc = name => gl.getUniformLocation(program, name);
     const uOrigin = loc('uOrigin');
     const uQ = loc('uQ');
@@ -808,14 +1030,10 @@ void main() {
         for (let i = count; i < MAX_SPHERES; i++)
             gpuTexRectData[i * 4 + 3] = 0;
         const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
-        const originU = prog === pointProgram ? pOrigin : uOrigin;
-        const qU = prog === pointProgram ? pQ : uQ;
-        const fovU = prog === pointProgram ? pFov : uFov;
-        const aspectU = prog === pointProgram ? pAspect : uAspect;
-        const planeU = prog === pointProgram ? pPlane : uPlane;
-        const resU = prog === pointProgram ? pRes : uRes;
-        const countU = prog === pointProgram ? pCount : uCount;
-        gl.useProgram(prog);
+        const treeOn = !!(treeProgram && count >= RAY_OCTREE_AT && packGpuNodes(count));
+        const active = prog === pointProgram ? pointProgram : (treeOn ? treeProgram : program);
+        const U = name => gl.getUniformLocation(active, name);
+        gl.useProgram(active);
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, sphereTex);
@@ -832,17 +1050,23 @@ void main() {
             gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, ATLAS, ATLAS, gl.RGBA, gl.UNSIGNED_BYTE, gpuAtlasData);
             atlasDirty = false;
         }
-        gl.uniform1i(prog === pointProgram ? ploc('uSpheres') : loc('uSpheres'), 0);
-        gl.uniform1i(prog === pointProgram ? ploc('uColors') : loc('uColors'), 1);
-        gl.uniform1i(prog === pointProgram ? ploc('uTexRects') : loc('uTexRects'), 2);
-        gl.uniform1i(prog === pointProgram ? ploc('uAtlas') : loc('uAtlas'), 3);
-        gl.uniform3f(originU, scene.camera.origin[0], scene.camera.origin[1], scene.camera.origin[2]);
-        gl.uniform4f(qU, q[0], q[1], q[2], q[3]);
-        gl.uniform1f(fovU, scene.camera.fov);
-        gl.uniform1f(aspectU, scene.camera.aspect);
-        gl.uniform1f(planeU, scene.camera.planeDistance);
-        gl.uniform2f(resU, canvas.width, canvas.height);
-        gl.uniform1i(countU, count);
+        gl.uniform1i(U('uSpheres'), 0);
+        gl.uniform1i(U('uColors'), 1);
+        gl.uniform1i(U('uTexRects'), 2);
+        gl.uniform1i(U('uAtlas'), 3);
+        gl.uniform3f(U('uOrigin'), scene.camera.origin[0], scene.camera.origin[1], scene.camera.origin[2]);
+        gl.uniform4f(U('uQ'), q[0], q[1], q[2], q[3]);
+        gl.uniform1f(U('uFov'), scene.camera.fov);
+        gl.uniform1f(U('uAspect'), scene.camera.aspect);
+        gl.uniform1f(U('uPlane'), scene.camera.planeDistance);
+        gl.uniform2f(U('uRes'), canvas.width, canvas.height);
+        gl.uniform1i(U('uCount'), count);
+        if (treeOn) {
+            gl.activeTexture(gl.TEXTURE5);
+            gl.bindTexture(gl.TEXTURE_2D, nodeTex);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 4, nodeN, gl.RGBA, gl.FLOAT, gpuNodeData);
+            gl.uniform1i(U('uNodes'), 5);
+        }
         return count;
     };
     let fence = null;
@@ -1158,6 +1382,7 @@ const applySize = (w, h, mode) => {
     context.putImageData(frame, 0, 0);
 };
 const paintRandomCPU = (scene, count) => {
+    prepareRayTree(scene);
     if (!frame || frame.width !== canvas.width || frame.height !== canvas.height)
         frame = context.createImageData(canvas.width, canvas.height);
     const w = frame.width;
@@ -1791,7 +2016,7 @@ function createUniverse(existingMasses) {
         gravityConstant: 6.67408e-7,
         speedlimit: 300000,
         fieldOfView: 120,
-        maximumMasses: 200,
+        maximumMasses: 8192,
         positionHistory: 0,
         eventLog: []
     };
@@ -1846,6 +2071,293 @@ function poof([_, mass], state) {
     if (mass === state.currentCameraTarget)
         state.currentCameraTarget = getGreatestMass(state);
 }
+const GRAVITY_OCTREE_AT = 1000;
+const RAY_OCTREE_AT = 32;
+const OCTREE_THETA2 = 0.36;
+const MAX_OCTREE_BODIES = 8192;
+const MAX_OCTREE_NODES = 32768;
+const bodyX = new Float64Array(MAX_OCTREE_BODIES);
+const bodyY = new Float64Array(MAX_OCTREE_BODIES);
+const bodyZ = new Float64Array(MAX_OCTREE_BODIES);
+const bodyM = new Float64Array(MAX_OCTREE_BODIES);
+const bodyR = new Float64Array(MAX_OCTREE_BODIES);
+const bodyIdx = new Int32Array(MAX_OCTREE_BODIES);
+const rayObjs = new Array(MAX_OCTREE_BODIES);
+const nodeX = new Float64Array(MAX_OCTREE_NODES);
+const nodeY = new Float64Array(MAX_OCTREE_NODES);
+const nodeZ = new Float64Array(MAX_OCTREE_NODES);
+const nodeHalf = new Float64Array(MAX_OCTREE_NODES);
+const nodeMass = new Float64Array(MAX_OCTREE_NODES);
+const nodeComX = new Float64Array(MAX_OCTREE_NODES);
+const nodeComY = new Float64Array(MAX_OCTREE_NODES);
+const nodeComZ = new Float64Array(MAX_OCTREE_NODES);
+const nodeRad = new Float64Array(MAX_OCTREE_NODES);
+const nodeStart = new Int32Array(MAX_OCTREE_NODES);
+const nodeLen = new Int32Array(MAX_OCTREE_NODES);
+const nodeChild = new Int32Array(MAX_OCTREE_NODES);
+const nodeIds = new Int16Array(MAX_OCTREE_NODES * 8);
+const octStack = new Int32Array(4096);
+let nodeN = 0;
+function buildOctree(n) {
+    nodeN = 0;
+    if (n < 1)
+        return -1;
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < n; i++) {
+        const x = bodyX[i], y = bodyY[i], z = bodyZ[i];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+        bodyIdx[i] = i;
+    }
+    const root = nodeN++;
+    nodeHalf[root] = Math.max(maxX - minX, maxY - minY, maxZ - minZ) / 2 + 1;
+    nodeX[root] = (minX + maxX) / 2;
+    nodeY[root] = (minY + maxY) / 2;
+    nodeZ[root] = (minZ + maxZ) / 2;
+    nodeStart[root] = 0;
+    nodeLen[root] = n;
+    nodeChild[root] = -1;
+    const stack = [root];
+    while (stack.length) {
+        const id = stack.pop();
+        if (nodeLen[id] <= 8 || nodeHalf[id] < 4 || nodeN + 8 > MAX_OCTREE_NODES)
+            continue;
+        const h = nodeHalf[id] / 2;
+        const base = nodeN;
+        nodeChild[id] = base;
+        for (let k = 0; k < 8; k++) {
+            const c = nodeN++;
+            nodeHalf[c] = h;
+            nodeChild[c] = -1;
+            nodeLen[c] = 0;
+            nodeX[c] = nodeX[id] + (k & 1 ? h : -h);
+            nodeY[c] = nodeY[id] + (k & 2 ? h : -h);
+            nodeZ[c] = nodeZ[id] + (k & 4 ? h : -h);
+        }
+        const st = nodeStart[id];
+        const len = nodeLen[id];
+        const counts = [0, 0, 0, 0, 0, 0, 0, 0];
+        for (let i = 0; i < len; i++) {
+            const bi = bodyIdx[st + i];
+            const oct = (bodyX[bi] >= nodeX[id] ? 1 : 0) | (bodyY[bi] >= nodeY[id] ? 2 : 0) | (bodyZ[bi] >= nodeZ[id] ? 4 : 0);
+            counts[oct]++;
+        }
+        let run = st;
+        for (let k = 0; k < 8; k++) {
+            nodeStart[base + k] = run;
+            nodeLen[base + k] = counts[k];
+            run += counts[k];
+        }
+        const tmp = new Int32Array(len);
+        const fill = counts.slice();
+        for (let k = 0; k < 8; k++)
+            fill[k] = nodeStart[base + k] - st;
+        for (let i = 0; i < len; i++) {
+            const bi = bodyIdx[st + i];
+            const oct = (bodyX[bi] >= nodeX[id] ? 1 : 0) | (bodyY[bi] >= nodeY[id] ? 2 : 0) | (bodyZ[bi] >= nodeZ[id] ? 4 : 0);
+            tmp[fill[oct]++] = bi;
+        }
+        for (let i = 0; i < len; i++)
+            bodyIdx[st + i] = tmp[i];
+        for (let k = 0; k < 8; k++)
+            if (nodeLen[base + k] > 0)
+                stack.push(base + k);
+    }
+    const order = [];
+    const walk = [root];
+    while (walk.length) {
+        const id = walk.pop();
+        order.push(id);
+        const base = nodeChild[id];
+        if (base >= 0)
+            for (let k = 0; k < 8; k++)
+                if (nodeLen[base + k] > 0)
+                    walk.push(base + k);
+    }
+    for (let i = order.length - 1; i >= 0; i--) {
+        const id = order[i];
+        const base = nodeChild[id];
+        let mass = 0, cx = 0, cy = 0, cz = 0, rad = 0;
+        if (base < 0) {
+            for (let j = 0; j < nodeLen[id]; j++) {
+                const bi = bodyIdx[nodeStart[id] + j];
+                const mm = bodyM[bi];
+                mass += mm;
+                cx += bodyX[bi] * mm;
+                cy += bodyY[bi] * mm;
+                cz += bodyZ[bi] * mm;
+                if (bodyR[bi] > rad)
+                    rad = bodyR[bi];
+            }
+        }
+        else {
+            for (let k = 0; k < 8; k++) {
+                if (nodeLen[base + k] <= 0)
+                    continue;
+                const c = base + k;
+                mass += nodeMass[c];
+                cx += nodeComX[c] * nodeMass[c];
+                cy += nodeComY[c] * nodeMass[c];
+                cz += nodeComZ[c] * nodeMass[c];
+                if (nodeRad[c] > rad)
+                    rad = nodeRad[c];
+            }
+        }
+        nodeMass[id] = mass;
+        nodeRad[id] = rad;
+        nodeComX[id] = mass ? cx / mass : nodeX[id];
+        nodeComY[id] = mass ? cy / mass : nodeY[id];
+        nodeComZ[id] = mass ? cz / mass : nodeZ[id];
+    }
+    for (let id = 0; id < nodeN; id++) {
+        if (nodeChild[id] >= 0)
+            continue;
+        const st = nodeStart[id];
+        const len = nodeLen[id] < 8 ? nodeLen[id] : 8;
+        for (let k = 0; k < len; k++)
+            nodeIds[id * 8 + k] = bodyIdx[st + k];
+    }
+    return root;
+}
+function gravityOctree(state) {
+    const universe = state.universe;
+    const n = universe.length;
+    const G = state.gravityConstant;
+    const collisionList = state.collisionList;
+    for (let i = 0; i < n; i++) {
+        const mass = universe[i];
+        const p = mass.position;
+        bodyX[i] = p[0];
+        bodyY[i] = p[1];
+        bodyZ[i] = p[2];
+        bodyM[i] = mass.mass;
+        bodyR[i] = mass.collisionSize;
+    }
+    const root = buildOctree(n);
+    for (let i = 0; i < n; i++) {
+        const mass = universe[i];
+        const g = mass.gravity;
+        const ix = bodyX[i], iy = bodyY[i], iz = bodyZ[i];
+        const si = bodyR[i], mi = bodyM[i];
+        let sp = 0;
+        octStack[sp++] = root;
+        while (sp > 0) {
+            const id = octStack[--sp];
+            const base = nodeChild[id];
+            if (base < 0) {
+                const st = nodeStart[id];
+                const len = nodeLen[id];
+                for (let k = 0; k < len; k++) {
+                    const j = bodyIdx[st + k];
+                    if (j === i)
+                        continue;
+                    const other = universe[j];
+                    const dx = bodyX[j] - ix, dy = bodyY[j] - iy, dz = bodyZ[j] - iz;
+                    const d2 = dx * dx + dy * dy + dz * dz;
+                    if (d2 < 1e-8)
+                        continue;
+                    const inv = G * mi * bodyM[j] / (d2 * Math.sqrt(d2));
+                    g[0] += dx * inv;
+                    g[1] += dy * inv;
+                    g[2] += dz * inv;
+                    if (j > i && Math.sqrt(d2) < si + bodyR[j]) {
+                        if (mi <= other.mass)
+                            collisionList.push([mass, other, i, j]);
+                        else
+                            collisionList.push([other, mass, j, i]);
+                    }
+                }
+                continue;
+            }
+            const dx = nodeComX[id] - ix, dy = nodeComY[id] - iy, dz = nodeComZ[id] - iz;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            const half = nodeHalf[id];
+            const pad = half + nodeRad[id] + si;
+            const ax = Math.abs(ix - nodeX[id]);
+            const ay = Math.abs(iy - nodeY[id]);
+            const az = Math.abs(iz - nodeZ[id]);
+            const size = half * 2;
+            // Open the cell if this body could touch anything in it. A
+            // center-of-mass sphere misses bodies sitting in a far corner.
+            const near = ax <= pad && ay <= pad && az <= pad;
+            if (!near && d2 > 1e-8 && size * size < d2 * OCTREE_THETA2) {
+                const inv = G * mi * nodeMass[id] / (d2 * Math.sqrt(d2));
+                g[0] += dx * inv;
+                g[1] += dy * inv;
+                g[2] += dz * inv;
+                continue;
+            }
+            for (let k = 0; k < 8; k++)
+                if (nodeLen[base + k] > 0 && sp < octStack.length)
+                    octStack[sp++] = base + k;
+        }
+        div(g, g, mi);
+    }
+}
+function prepareRayTree(scene) {
+    const objects = scene.objects;
+    let n = 0;
+    for (let i = 0; i < objects.length && n < MAX_OCTREE_BODIES; i++) {
+        const item = objects[i];
+        if (item[0] !== 'sphere')
+            continue;
+        const sphere = item[1];
+        const p = sphere.origin;
+        bodyX[n] = p[0];
+        bodyY[n] = p[1];
+        bodyZ[n] = p[2];
+        bodyM[n] = 1;
+        bodyR[n] = sphere.radius;
+        rayObjs[n] = sphere;
+        n++;
+    }
+    if (n < RAY_OCTREE_AT) {
+        scene._rayRoot = -1;
+        return;
+    }
+    scene._rayRoot = buildOctree(n);
+    scene._rayN = n;
+}
+function packGpuNodes(count) {
+    for (let i = 0; i < count; i++) {
+        bodyX[i] = gpuSphereData[i * 4];
+        bodyY[i] = gpuSphereData[i * 4 + 1];
+        bodyZ[i] = gpuSphereData[i * 4 + 2];
+        bodyR[i] = gpuSphereData[i * 4 + 3];
+        bodyM[i] = 1;
+    }
+    const root = buildOctree(count);
+    if (root < 0 || nodeN > MAX_GPU_NODES || nodeN < 1)
+        return false;
+    for (let id = 0; id < nodeN; id++) {
+        if (nodeChild[id] < 0 && nodeLen[id] > 8)
+            return false;
+    }
+    for (let id = 0; id < nodeN; id++) {
+        const o = id * 16;
+        const ids = id * 8;
+        gpuNodeData[o] = nodeX[id];
+        gpuNodeData[o + 1] = nodeY[id];
+        gpuNodeData[o + 2] = nodeZ[id];
+        gpuNodeData[o + 3] = nodeHalf[id] + nodeRad[id];
+        gpuNodeData[o + 4] = nodeChild[id];
+        gpuNodeData[o + 5] = nodeLen[id];
+        gpuNodeData[o + 6] = nodeChild[id] < 0 ? nodeIds[ids] : 0;
+        gpuNodeData[o + 7] = nodeChild[id] < 0 ? nodeIds[ids + 1] : 0;
+        gpuNodeData[o + 8] = nodeChild[id] < 0 ? nodeIds[ids + 2] : 0;
+        gpuNodeData[o + 9] = nodeChild[id] < 0 ? nodeIds[ids + 3] : 0;
+        gpuNodeData[o + 10] = nodeChild[id] < 0 ? nodeIds[ids + 4] : 0;
+        gpuNodeData[o + 11] = nodeChild[id] < 0 ? nodeIds[ids + 5] : 0;
+        gpuNodeData[o + 12] = nodeChild[id] < 0 ? nodeIds[ids + 6] : 0;
+        gpuNodeData[o + 13] = nodeChild[id] < 0 ? nodeIds[ids + 7] : 0;
+    }
+    return true;
+}
 function tick(state) {
     state.currentTick++;
     positionHalfTick(state);
@@ -1859,7 +2371,12 @@ function tick(state) {
             set(mass.gravity, 0, 0, 0);
         }
     }
-    function updateGravities({ universe, collisionList, ticksPerStep, gravityConstant, speedlimit }) {
+    function updateGravities(stateParts) {
+        if (stateParts.universe.length >= GRAVITY_OCTREE_AT) {
+            gravityOctree(state);
+            return;
+        }
+        const { universe, collisionList, ticksPerStep, gravityConstant, speedlimit } = stateParts;
         for (let i = 0; i < universe.length; i++)
             updatePairs(i, universe, collisionList, ticksPerStep, gravityConstant, speedlimit);
     }
