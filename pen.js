@@ -531,10 +531,11 @@ const paint = (data, context) => {
 };
 let frame;
 const MAX_SPHERES = 64;
-const MAX_GPU_NODES = 512;
-const gpuSphereData = new Float32Array(MAX_SPHERES * 4);
-const gpuColorData = new Float32Array(MAX_SPHERES * 4);
-const gpuTexRectData = new Float32Array(MAX_SPHERES * 4);
+const MAX_RENDER = 2048;
+const MAX_GPU_NODES = 2048;
+const gpuSphereData = new Float32Array(MAX_RENDER * 4);
+const gpuColorData = new Float32Array(MAX_RENDER * 4);
+const gpuTexRectData = new Float32Array(MAX_RENDER * 4);
 const gpuNodeData = new Float32Array(MAX_GPU_NODES * 16);
 const gpuAtlasData = new Uint8Array(ATLAS * ATLAS * 4);
 const blitTexture = (tile, tex) => {
@@ -674,10 +675,10 @@ void considerSphere(int i, vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP,
     found = true;
 }
 void walkSpheres(vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP, inout vec3 hitC, inout float hitRef, inout int bestI, inout bool found) {
-    int stack[64];
+    int stack[96];
     int sp = 1;
     stack[0] = 0;
-    for (int step = 0; step < 128; step++) {
+    for (int step = 0; step < 80; step++) {
         if (sp <= 0)
             break;
         sp -= 1;
@@ -700,19 +701,20 @@ void walkSpheres(vec3 ro, vec3 rd, inout float bestT, inout vec3 hitP, inout vec
             if (len > 7) considerSphere(int(tail.y + 0.5), ro, rd, bestT, hitP, hitC, hitRef, bestI, found);
         } else {
             int child = int(meta.x + 0.5);
-            for (int k = 7; k >= 0; k--) {
+            for (int k = 0; k < 8; k++) {
+                vec4 cbox = texelFetch(uNodes, ivec2(0, child + k), 0);
                 vec4 cm = texelFetch(uNodes, ivec2(1, child + k), 0);
-                if (cm.y > 0.5 && sp < 64)
+                if (cm.y > 0.5 && nodeBox(ro, rd, cbox.xyz, cbox.w, bestT) && sp < 96)
                     stack[sp++] = child + k;
             }
         }
     }
 }
 bool treeBlocks(vec3 sro, vec3 ld, float lightT) {
-    int stack[64];
+    int stack[96];
     int sp = 1;
     stack[0] = 0;
-    for (int step = 0; step < 128; step++) {
+    for (int step = 0; step < 80; step++) {
         if (sp <= 0)
             break;
         sp -= 1;
@@ -756,9 +758,10 @@ bool treeBlocks(vec3 sro, vec3 ld, float lightT) {
             }
         } else {
             int child = int(meta.x + 0.5);
-            for (int k = 7; k >= 0; k--) {
+            for (int k = 0; k < 8; k++) {
+                vec4 cbox = texelFetch(uNodes, ivec2(0, child + k), 0);
                 vec4 cm = texelFetch(uNodes, ivec2(1, child + k), 0);
-                if (cm.y > 0.5 && sp < 64)
+                if (cm.y > 0.5 && nodeBox(sro, ld, cbox.xyz, cbox.w, lightT) && sp < 96)
                     stack[sp++] = child + k;
             }
         }
@@ -775,7 +778,12 @@ void main() {
     vec3 ro = uOrigin;
     vec3 accum = vec3(0.0);
     float thru = 1.0;
-    for (int bounce = 0; bounce < 5; bounce++) {
+#if TREE
+#define BOUNCES 2
+#else
+#define BOUNCES 5
+#endif
+    for (int bounce = 0; bounce < BOUNCES; bounce++) {
         float bestT = 1.0e30;
         vec3 hitP = ro;
         vec3 hitC = ro;
@@ -853,7 +861,7 @@ void main() {
 #endif
             hitRgb *= shade;
         }
-        float mirror = bounce == 4 ? 0.0 : clamp(hitRef, 0.0, 1.0);
+        float mirror = bounce + 1 == BOUNCES ? 0.0 : clamp(hitRef, 0.0, 1.0);
         accum += thru * hitRgb * (1.0 - mirror);
         thru *= mirror;
         if (thru <= 0.0)
@@ -877,9 +885,9 @@ void main() {
     };
     const vs = compile(gl.VERTEX_SHADER, vert);
     const fs = compile(gl.FRAGMENT_SHADER, fragSrc(0));
-    // The tree walk is slower than the direct loop at the 64 spheres this
-    // GPU path can draw, so it is not compiled. CPU rays still use the octree.
-    const treeFs = null;
+    // Direct loop stays on the small scenes. Past 64 spheres that loop cannot
+    // see the rest, so those scenes use the octree program.
+    const treeFs = compile(gl.FRAGMENT_SHADER, fragSrc(1));
     if (!vs || !fs)
         return null;
     const program = gl.createProgram();
@@ -917,7 +925,7 @@ void main() {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_SPHERES, 1, 0, gl.RGBA, gl.FLOAT, null);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_RENDER, 1, 0, gl.RGBA, gl.FLOAT, null);
     };
     alloc(sphereTex, 0);
     alloc(colorTex, 1);
@@ -952,8 +960,8 @@ void main() {
     gl.uniform1i(loc('uAtlas'), 3);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    const boundTex = new Array(MAX_SPHERES);
-    const boundRev = new Array(MAX_SPHERES).fill(0);
+    const boundTex = new Array(MAX_RENDER);
+    const boundRev = new Array(MAX_RENDER).fill(0);
     let atlasDirty = false;
     const pointVs = compile(gl.VERTEX_SHADER, pointVert);
     if (!pointVs)
@@ -998,7 +1006,7 @@ void main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     const upload = (prog, scene) => {
         const objects = scene.objects;
-        const count = Math.min(objects.length, MAX_SPHERES);
+        const count = Math.min(objects.length, MAX_RENDER);
         for (let i = 0; i < count; i++) {
             const sphere = objects[i][1];
             const o = sphere.origin;
@@ -1017,33 +1025,34 @@ void main() {
             gpuTexRectData[i * 4] = col / ATLAS_TILES;
             gpuTexRectData[i * 4 + 1] = row / ATLAS_TILES;
             gpuTexRectData[i * 4 + 2] = 1 / ATLAS_TILES;
-            gpuTexRectData[i * 4 + 3] = tex && tex.data ? 1 : 0;
+            gpuTexRectData[i * 4 + 3] = tex && tex.data && i < ATLAS_TILES * ATLAS_TILES ? 1 : 0;
             const rev = tex ? tex.revision || 0 : 0;
             if (boundTex[i] !== tex || boundRev[i] !== rev) {
-                if (tex && tex.data)
+                if (tex && tex.data && i < ATLAS_TILES * ATLAS_TILES)
                     blitTexture(i, tex);
                 boundTex[i] = tex;
                 boundRev[i] = rev;
                 atlasDirty = true;
             }
         }
-        for (let i = count; i < MAX_SPHERES; i++)
+        for (let i = count; i < MAX_RENDER; i++)
             gpuTexRectData[i * 4 + 3] = 0;
         const q = qFromUnitVectors([0, 0, 1], vUnit(scene.camera.dir));
-        const treeOn = !!(treeProgram && count >= RAY_OCTREE_AT && packGpuNodes(count));
+        const treeOn = count > MAX_SPHERES && !!(treeProgram && packGpuNodes(count));
         const active = prog === pointProgram ? pointProgram : (treeOn ? treeProgram : program);
+        const drawCount = treeOn ? count : Math.min(count, MAX_SPHERES);
         const U = name => gl.getUniformLocation(active, name);
         gl.useProgram(active);
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, sphereTex);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuSphereData);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_RENDER, 1, gl.RGBA, gl.FLOAT, gpuSphereData);
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, colorTex);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuColorData);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_RENDER, 1, gl.RGBA, gl.FLOAT, gpuColorData);
         gl.activeTexture(gl.TEXTURE2);
         gl.bindTexture(gl.TEXTURE_2D, rectTex);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_SPHERES, 1, gl.RGBA, gl.FLOAT, gpuTexRectData);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_RENDER, 1, gl.RGBA, gl.FLOAT, gpuTexRectData);
         if (atlasDirty) {
             gl.activeTexture(gl.TEXTURE3);
             gl.bindTexture(gl.TEXTURE_2D, atlasTex);
@@ -1060,7 +1069,7 @@ void main() {
         gl.uniform1f(U('uAspect'), scene.camera.aspect);
         gl.uniform1f(U('uPlane'), scene.camera.planeDistance);
         gl.uniform2f(U('uRes'), canvas.width, canvas.height);
-        gl.uniform1i(U('uCount'), count);
+        gl.uniform1i(U('uCount'), drawCount);
         if (treeOn) {
             gl.activeTexture(gl.TEXTURE5);
             gl.bindTexture(gl.TEXTURE_2D, nodeTex);
@@ -1449,7 +1458,8 @@ const paintAdaptive = (scene) => {
         canvas.width = target.w;
         canvas.height = target.h;
     }
-    const initial = touchDevice() ? 3600 : 16000;
+    const heavy = scene.objects && scene.objects.length > MAX_SPHERES;
+    const initial = touchDevice() ? 2400 : (heavy ? 3000 : 16000);
     if (!(adaptive.cap > 0))
         adaptive.cap = Math.min(nativePx, initial);
     // One display frame. A faster measured refresh wins; never budget more than 60Hz.
@@ -1599,11 +1609,8 @@ function syncSceneObjects(scene) {
     if (!universe)
         return;
     const objects = [];
-    const crowd = universe.length > MAX_SPHERES;
-    for (let i = 0; i < universe.length && objects.length < MAX_SPHERES; i++) {
+    for (let i = 0; i < universe.length && i < MAX_RENDER; i++) {
         const mass = universe[i];
-        if (crowd && i > 0 && mass.size < 4)
-            continue;
         const c = mass.color;
         objects.push(['sphere', {
             radius: mass.size,
@@ -1679,37 +1686,8 @@ function paintTrails() {
     }
     trailCtx.clearRect(0, 0, w, h);
     const bodies = scene.simState && scene.simState.universe;
-    if (!bodies)
+    if (!bodies || bodies.length > MAX_SPHERES)
         return;
-    if (bodies.length > MAX_SPHERES) {
-        const buckets = [[], [], [], []];
-        const styles = [
-            'rgba(255,214,90,0.95)',
-            'rgba(176,198,255,0.9)',
-            'rgba(255,176,114,0.9)',
-            'rgba(226,228,236,0.88)'
-        ];
-        for (let i = 0; i < bodies.length; i++) {
-            const here = worldToScreen(bodies[i].position, scene.camera, w, h);
-            if (!here)
-                continue;
-            buckets[i === 0 ? 0 : (i % 3) + 1].push(here[0], here[1]);
-        }
-        for (let b = 0; b < buckets.length; b++) {
-            const pts = buckets[b];
-            if (!pts.length)
-                continue;
-            trailCtx.beginPath();
-            trailCtx.fillStyle = styles[b];
-            const rad = b === 0 ? 6 : 1.6;
-            for (let i = 0; i < pts.length; i += 2) {
-                trailCtx.moveTo(pts[i] + rad, pts[i + 1]);
-                trailCtx.arc(pts[i], pts[i + 1], rad, 0, Math.PI * 2);
-            }
-            trailCtx.fill();
-        }
-        return;
-    }
     trailCtx.lineWidth = 2;
     trailCtx.lineJoin = 'round';
     for (let i = 0; i < bodies.length; i++) {
@@ -1962,7 +1940,7 @@ function crowdBodies() {
         const dist = inner + (outer - inner) * Math.sqrt((i + 0.5) / count);
         const ang = i * 2.399963229728653;
         const lift = Math.sin(i * 12.9898) * dist * 0.08;
-        const radius = 1.15;
+        const radius = 4.5;
         const mass = (4 / 3) * Math.PI * radius * radius * radius;
         const speed = Math.sqrt(G * sun.mass / dist);
         const body = new Mass(mass, palette[i % 3], [Math.cos(ang) * dist, Math.sin(ang) * dist, lift], [-Math.sin(ang) * speed, Math.cos(ang) * speed, 0]);
